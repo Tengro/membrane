@@ -1063,7 +1063,7 @@ export class Membrane {
     // Use formatter's buildMessages for all request building
     const buildResult = activeFormatter.buildMessages(request.messages, {
       participantMode: 'multiuser',
-      assistantParticipant: this.config.assistantParticipant ?? 'Claude',
+      assistantParticipant: request.assistantParticipant ?? this.config.assistantParticipant ?? 'Claude',
       tools: request.tools,
       thinking: request.config.thinking,
       systemPrompt: request.system,
