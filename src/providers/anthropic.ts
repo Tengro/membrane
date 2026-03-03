@@ -85,38 +85,151 @@ export class AnthropicAdapter implements ProviderAdapter {
     const fullRequest = { ...anthropicRequest, stream: true };
     options?.onRequest?.(fullRequest);
 
+    // Idle timeout: abort if no SSE event arrives within the deadline.
+    // The SDK's timeout only covers the initial HTTP response headers;
+    // once streaming starts, a silently dropped connection waits forever.
+    const idleMs = options?.idleTimeoutMs ?? 120_000;
+    const idleAbort = new AbortController();
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    let idleTimedOut = false;
+
+    // Link caller's signal so external cancellation still works
+    const onExternalAbort = () => idleAbort.abort();
+    if (options?.signal) {
+      if (options.signal.aborted) { idleAbort.abort(); }
+      else { options.signal.addEventListener('abort', onExternalAbort, { once: true }); }
+    }
+
+    const resetIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => { idleTimedOut = true; idleAbort.abort(); }, idleMs);
+    };
+
+    resetIdleTimer();
+
     try {
       const stream = await this.client.messages.stream(anthropicRequest, {
-        signal: options?.signal,
+        signal: idleAbort.signal,
       });
 
-      let accumulated = '';
-      const contentBlocks: unknown[] = [];
+      // Accumulate response metadata from SSE events directly, so we can
+      // skip finalMessage() and its variable-latency connection teardown.
+      let model = '';
+      let inputTokens = 0;
+      let outputTokens = 0;
+      let cacheCreationTokens: number | undefined;
+      let cacheReadTokens: number | undefined;
+      let stopReason: string = 'end_turn';
+      let stopSequence: string | undefined;
+
+      // Content block tracking — finalized on content_block_stop
+      const contentBlocks: Record<string, unknown>[] = [];
       let currentBlockIndex = -1;
+      let currentBlockContent = '';
+      let currentBlockInputJson = '';
 
       for await (const event of stream) {
-        if (event.type === 'content_block_start') {
+        resetIdleTimer();
+        if (event.type === 'message_start') {
+          model = event.message.model;
+          const usage = event.message.usage as unknown as Record<string, number>;
+          inputTokens = usage.input_tokens ?? 0;
+          cacheCreationTokens = usage.cache_creation_input_tokens;
+          cacheReadTokens = usage.cache_read_input_tokens;
+
+        } else if (event.type === 'content_block_start') {
           currentBlockIndex = event.index;
-          contentBlocks[currentBlockIndex] = event.content_block;
+          currentBlockContent = '';
+          currentBlockInputJson = '';
+          contentBlocks[currentBlockIndex] = { ...event.content_block };
           callbacks.onContentBlock?.(currentBlockIndex, event.content_block);
+
         } else if (event.type === 'content_block_delta') {
           if (event.delta.type === 'text_delta') {
             const chunk = event.delta.text;
-            accumulated += chunk;
+            currentBlockContent += chunk;
             callbacks.onChunk(chunk);
           } else if (event.delta.type === 'thinking_delta') {
-            // Handle thinking delta
+            currentBlockContent += event.delta.thinking;
             callbacks.onChunk(event.delta.thinking);
+          } else if ((event.delta as { type: string }).type === 'input_json_delta') {
+            currentBlockInputJson += (event.delta as { partial_json: string }).partial_json;
           }
+
         } else if (event.type === 'content_block_stop') {
-          callbacks.onContentBlock?.(currentBlockIndex, contentBlocks[currentBlockIndex]);
+          // Finalize block — use event.index for defensive correctness
+          const blockIdx = (event as { index: number }).index;
+          const block = contentBlocks[blockIdx];
+          if (block) {
+            if (block.type === 'text') {
+              block.text = currentBlockContent;
+            } else if (block.type === 'thinking') {
+              block.thinking = currentBlockContent;
+            } else if (block.type === 'tool_use' && currentBlockInputJson) {
+              try { block.input = JSON.parse(currentBlockInputJson); } catch { /* partial JSON */ }
+            }
+          }
+          callbacks.onContentBlock?.(blockIdx, contentBlocks[blockIdx]);
+
+        } else if (event.type === 'message_delta') {
+          // All content blocks are finalized by the time message_delta arrives.
+          // Capture final metadata and exit — message_stop and the SSE connection
+          // teardown after it add only variable latency with no useful data.
+          const delta = event.delta as { stop_reason?: string; stop_sequence?: string };
+          stopReason = delta.stop_reason ?? 'end_turn';
+          stopSequence = delta.stop_sequence ?? undefined;
+          outputTokens = (event.usage as { output_tokens: number }).output_tokens ?? 0;
+          break;
         }
       }
 
-      const finalMessage = await stream.finalMessage();
-      return this.parseResponse(finalMessage, fullRequest);
+      // Clean up idle timer and external signal listener
+      if (idleTimer) clearTimeout(idleTimer);
+      options?.signal?.removeEventListener('abort', onExternalAbort);
+
+      // Force-close the HTTP connection so we don't block on SSE drain
+      try { stream.controller.abort(); } catch { /* already closed */ }
+
+      return {
+        content: contentBlocks,
+        stopReason,
+        stopSequence,
+        usage: {
+          inputTokens,
+          outputTokens,
+          cacheCreationTokens,
+          cacheReadTokens,
+        },
+        model,
+        rawRequest: fullRequest,
+        raw: {
+          content: contentBlocks,
+          stop_reason: stopReason,
+          stop_sequence: stopSequence ?? null,
+          model,
+          usage: {
+            input_tokens: inputTokens,
+            output_tokens: outputTokens,
+            cache_creation_input_tokens: cacheCreationTokens,
+            cache_read_input_tokens: cacheReadTokens,
+          },
+        },
+      };
 
     } catch (error) {
+      // Clean up timer on error path too
+      if (idleTimer) clearTimeout(idleTimer);
+      options?.signal?.removeEventListener('abort', onExternalAbort);
+
+      if (idleTimedOut && error instanceof Error && error.name === 'AbortError') {
+        throw new MembraneError({
+          type: 'timeout',
+          message: `SSE stream idle timeout — no events received within ${idleMs}ms`,
+          retryable: true,
+          rawError: error,
+          rawRequest: fullRequest,
+        });
+      }
       throw this.handleError(error, fullRequest);
     }
   }

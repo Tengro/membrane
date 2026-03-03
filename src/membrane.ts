@@ -203,14 +203,19 @@ export class Membrane {
     if (request.toolMode && request.toolMode !== 'auto') {
       return request.toolMode;
     }
-    
-    // Auto mode: choose based on provider
-    // OpenRouter and OpenAI-compatible APIs use native tools
-    // Anthropic direct with prefill mode uses XML tools
+
+    // Auto mode: choose based on formatter
+    // NativeFormatter → native tools via API
+    // AnthropicXmlFormatter (default) → XML tools in prefill
+    if (this.formatter.name === 'native') {
+      return 'native';
+    }
+
+    // Also handle known native-tool providers regardless of formatter
     if (this.adapter.name === 'openrouter') {
       return 'native';
     }
-    
+
     // Default to XML for prefill compatibility
     return 'xml';
   }
@@ -837,14 +842,17 @@ export class Membrane {
             });
           }
 
-          // Add assistant message with tool use and user message with tool results
+          // Add assistant message with tool use and user message with tool results.
+          // Use the request's participant name so role mapping is consistent.
+          const asstName = request.assistantParticipant
+            ?? this.config.assistantParticipant ?? 'Claude';
           messages.push({
-            participant: 'Claude',
+            participant: asstName,
             content: responseBlocks,
           });
 
           messages.push({
-            participant: 'User',
+            participant: asstName === 'Claude' ? 'User' : 'user',
             content: results.map(r => ({
               type: 'tool_result' as const,
               toolUseId: r.toolUseId,
@@ -923,8 +931,11 @@ export class Membrane {
     // Convert messages to provider format
     const providerMessages: any[] = [];
     
+    const assistantName = request.assistantParticipant
+      ?? this.config.assistantParticipant ?? 'Claude';
+
     for (const msg of messages) {
-      const isAssistant = msg.participant === 'Claude';
+      const isAssistant = msg.participant === assistantName;
       const role = isAssistant ? 'assistant' : 'user';
       
       // Convert content blocks
@@ -940,7 +951,7 @@ export class Membrane {
           content.push({
             type: 'tool_use',
             id: block.id,
-            name: block.name,
+            name: sanitizeToolName(block.name),
             input: block.input,
           });
         } else if (block.type === 'tool_result') {
@@ -972,9 +983,11 @@ export class Membrane {
       providerMessages.push({ role, content });
     }
     
-    // Convert tools to provider format
+    // Convert tools to provider format.
+    // Native tool names must match ^[a-zA-Z0-9_-]{1,128}$ — sanitize colons
+    // from the module:tool namespace convention. Reversed in parseProviderContent.
     const tools = request.tools?.map(tool => ({
-      name: tool.name,
+      name: sanitizeToolName(tool.name),
       description: tool.description,
       input_schema: tool.inputSchema,
     }));
@@ -1017,7 +1030,7 @@ export class Membrane {
           blocks.push({
             type: 'tool_use',
             id: item.id,
-            name: item.name,
+            name: unsanitizeToolName(item.name),
             input: item.input,
           });
         } else if (item.type === 'thinking') {
@@ -1071,7 +1084,7 @@ export class Membrane {
     // Use formatter's buildMessages for all request building
     const buildResult = activeFormatter.buildMessages(request.messages, {
       participantMode: 'multiuser',
-      assistantParticipant: this.config.assistantParticipant ?? 'Claude',
+      assistantParticipant: request.assistantParticipant ?? this.config.assistantParticipant ?? 'Claude',
       tools: request.tools,
       thinking: request.config.thinking,
       systemPrompt: request.system,
@@ -1107,7 +1120,7 @@ export class Membrane {
   private async streamOnce(
     request: any,
     callbacks: { onChunk: (chunk: string) => void; onContentBlock?: (index: number, block: unknown) => void },
-    options: { signal?: AbortSignal; timeoutMs?: number; onRequest?: (rawRequest: unknown) => void }
+    options: { signal?: AbortSignal; timeoutMs?: number; idleTimeoutMs?: number; onRequest?: (rawRequest: unknown) => void }
   ) {
     return await this.adapter.stream(request, callbacks, options);
   }
@@ -1693,6 +1706,7 @@ export class Membrane {
           {
             signal: stream.signal,
             timeoutMs: options.timeoutMs,
+            idleTimeoutMs: options.idleTimeoutMs,
             onRequest: (req: unknown) => { rawRequest = req; },
           }
         );
@@ -2070,6 +2084,7 @@ export class Membrane {
           {
             signal: stream.signal,
             timeoutMs: options.timeoutMs,
+            idleTimeoutMs: options.idleTimeoutMs,
             onRequest: (req: unknown) => { rawRequest = req; },
           }
         );
@@ -2135,14 +2150,16 @@ export class Membrane {
             });
           }
 
-          // Add messages for next iteration
+          // Add messages for next iteration — use the request's participant names
+          const assistantName = request.assistantParticipant
+            ?? this.config.assistantParticipant ?? 'Claude';
           messages.push({
-            participant: 'Claude',
+            participant: assistantName,
             content: responseBlocks,
           });
 
           messages.push({
-            participant: 'User',
+            participant: assistantName === 'Claude' ? 'User' : 'user',
             content: results.map(r => ({
               type: 'tool_result' as const,
               toolUseId: r.toolUseId,
@@ -2211,4 +2228,16 @@ export class Membrane {
       }
     }
   }
+}
+
+// Native tool names must match ^[a-zA-Z0-9_-]{1,128}$.
+// The framework uses module:tool namespacing, so we round-trip colons
+// through an escape encoding for the API wire format.
+// Lossless: escape underscores first (_u), then encode colons (_c).
+function sanitizeToolName(name: string): string {
+  return name.replace(/_/g, '_u').replace(/:/g, '_c');
+}
+
+function unsanitizeToolName(name: string): string {
+  return name.replace(/_c/g, ':').replace(/_u/g, '_');
 }
