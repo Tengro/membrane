@@ -332,10 +332,26 @@ export class BedrockAdapter implements ProviderAdapter {
   }
 
   private buildRequest(request: ProviderRequest): BedrockMessageRequest {
+    // Strip provider-specific fields (e.g., sourceUrl for Gemini) from image blocks
+    // before sending to Bedrock/Anthropic, which rejects extra inputs
+    const sanitizedMessages = (request.messages as any[]).map((msg: any) => {
+      if (!Array.isArray(msg.content)) return msg;
+      return {
+        ...msg,
+        content: msg.content.map((block: any) => {
+          if (block.type === 'image' && block.sourceUrl !== undefined) {
+            const { sourceUrl, ...rest } = block;
+            return rest;
+          }
+          return block;
+        }),
+      };
+    });
+
     const params: BedrockMessageRequest = {
       anthropic_version: this.anthropicVersion,
       max_tokens: request.maxTokens || this.defaultMaxTokens,
-      messages: request.messages as BedrockMessageRequest['messages'],
+      messages: sanitizedMessages as BedrockMessageRequest['messages'],
     };
 
     // Handle system prompt
