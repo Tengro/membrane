@@ -152,9 +152,9 @@ export class Membrane {
             }
           }
 
-          // Wait before retry
+          // Wait before retry (abort-aware)
           const delay = this.calculateRetryDelay(attempts);
-          await this.sleep(delay);
+          await this.sleep(delay, options.signal);
           continue;
         }
 
@@ -715,6 +715,7 @@ export class Membrane {
     let toolDepth = 0;
     let totalUsage: DetailedUsage = { inputTokens: 0, outputTokens: 0 };
     let lastStopReason: StopReason = 'end_turn';
+    let lastStopSequence: string | undefined;
     let rawRequest: unknown;
     let rawResponse: unknown;
 
@@ -772,6 +773,7 @@ export class Membrane {
         onResponse?.(rawResponse);
 
         lastStopReason = this.mapStopReason(streamResult.stopReason);
+        lastStopSequence = streamResult.stopSequence ?? undefined;
 
         // Accumulate usage (including cache metrics)
         totalUsage.inputTokens += streamResult.usage.inputTokens;
@@ -881,6 +883,7 @@ export class Membrane {
         details: {
           stop: {
             reason: lastStopReason,
+            triggeredSequence: lastStopSequence,
             wasTruncated: lastStopReason === 'max_tokens',
           },
           usage: { ...totalUsage },
@@ -1096,10 +1099,15 @@ export class Membrane {
       prefillUserMessage: request.prefillUserMessage,
     });
 
+    // Anthropic requires temperature=1 when extended thinking is enabled
+    const temperature = request.config.thinking?.enabled
+      ? 1
+      : request.config.temperature;
+
     const providerRequest = {
       model: request.config.model,
       maxTokens: request.config.maxTokens,
-      temperature: request.config.temperature,
+      temperature,
       topP: request.config.topP,
       topK: request.config.topK,
       presencePenalty: request.config.presencePenalty,
@@ -1482,8 +1490,18 @@ export class Membrane {
     return new MembraneError(errorInfo);
   }
 
-  private sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  private sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(signal.reason ?? new DOMException('The operation was aborted.', 'AbortError'));
+        return;
+      }
+      const timer = setTimeout(resolve, ms);
+      signal?.addEventListener('abort', () => {
+        clearTimeout(timer);
+        reject(signal.reason ?? new DOMException('The operation was aborted.', 'AbortError'));
+      }, { once: true });
+    });
   }
 
   /**

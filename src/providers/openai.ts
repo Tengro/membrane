@@ -31,6 +31,18 @@ import {
 } from '../types/index.js';
 
 // ============================================================================
+// Utilities
+// ============================================================================
+
+function safeParseJson(str: string | undefined): Record<string, unknown> {
+  try {
+    return JSON.parse(str || '{}');
+  } catch {
+    return {};
+  }
+}
+
+// ============================================================================
 // Types
 // ============================================================================
 
@@ -594,7 +606,7 @@ export class OpenAIAdapter implements ProviderAdapter {
           type: 'tool_use',
           id: tc.id,
           name: tc.function.name,
-          input: JSON.parse(tc.function.arguments || '{}'),
+          input: safeParseJson(tc.function.arguments),
         });
       }
     }
@@ -690,7 +702,7 @@ export function fromOpenAIContent(message: OpenAIMessage): ContentBlock[] {
         type: 'tool_use',
         id: tc.id,
         name: tc.function.name,
-        input: JSON.parse(tc.function.arguments || '{}'),
+        input: safeParseJson(tc.function.arguments),
       });
     }
   }
