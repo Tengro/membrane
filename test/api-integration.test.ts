@@ -637,10 +637,11 @@ await runTest('Temperature enforcement: complete() with thinking enabled', async
   assert(response.content.length > 0, 'Got response content with thinking enabled');
   assert(capturedRequest?.temperature === 1, `Temperature forced to 1 (was ${capturedRequest?.temperature})`);
 
-  // Check that thinking content was present
+  // Check that thinking and text content were present
   const hasThinking = response.content.some((b: ContentBlock) => b.type === 'thinking');
   const hasText = response.content.some((b: ContentBlock) => b.type === 'text');
   console.log(`  Content blocks: ${response.content.map((b: ContentBlock) => b.type).join(', ')}`);
+  assert(hasThinking, 'Response includes thinking content');
   assert(hasText, 'Response includes text content');
 });
 

@@ -588,7 +588,7 @@ export class BedrockAdapter implements ProviderAdapter {
                     }
                   } else if (eventData.delta?.type === 'signature_delta' && (eventData.delta as any).signature) {
                     if (contentBlocks[currentBlockIndex]) {
-                      contentBlocks[currentBlockIndex]!.signature = (eventData.delta as any).signature;
+                      contentBlocks[currentBlockIndex]!.signature = (contentBlocks[currentBlockIndex]!.signature ?? '') + (eventData.delta as any).signature;
                     }
                   }
                 } else if (eventData.type === 'message_delta') {

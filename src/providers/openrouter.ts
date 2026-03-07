@@ -22,18 +22,7 @@ import {
   abortError,
   networkError,
 } from '../types/index.js';
-
-// ============================================================================
-// Utilities
-// ============================================================================
-
-function safeParseJson(str: string | undefined): Record<string, unknown> {
-  try {
-    return JSON.parse(str || '{}');
-  } catch {
-    return {};
-  }
-}
+import { safeParseJson } from './utils.js';
 
 // ============================================================================
 // Types

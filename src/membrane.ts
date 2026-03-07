@@ -255,6 +255,7 @@ export class Membrane {
     let totalUsage: DetailedUsage = { inputTokens: 0, outputTokens: 0 };
     const contentBlocks: ContentBlock[] = [];
     let lastStopReason: StopReason = 'end_turn';
+    let lastStopSequence: string | undefined;
     let rawRequest: unknown;
     let rawResponse: unknown;
 
@@ -393,6 +394,7 @@ export class Membrane {
         onResponse?.(rawResponse);
 
         lastStopReason = this.mapStopReason(streamResult.stopReason);
+        lastStopSequence = streamResult.stopSequence ?? undefined;
 
         // Accumulate usage (including cache metrics)
         totalUsage.inputTokens += streamResult.usage.inputTokens;
@@ -662,7 +664,8 @@ export class Membrane {
         rawResponse,
         executedToolCalls,
         executedToolResults,
-        initialBlockType
+        initialBlockType,
+        lastStopSequence
       );
 
       // Append non-text content blocks (e.g., generated_image) that the XML parser can't handle
@@ -1392,7 +1395,8 @@ export class Membrane {
     rawResponse: unknown,
     executedToolCalls: ToolCall[] = [],
     executedToolResults: ToolResult[] = [],
-    startInsideBlock: 'thinking' | 'tool_call' | 'tool_result' | null = null
+    startInsideBlock: 'thinking' | 'tool_call' | 'tool_result' | null = null,
+    triggeredSequence?: string
   ): NormalizedResponse {
     // Parse accumulated text into structured content blocks
     // This extracts thinking, tool_use, tool_result, and text blocks
@@ -1428,6 +1432,7 @@ export class Membrane {
       details: {
         stop: {
           reason: stopReason,
+          triggeredSequence,
           wasTruncated: stopReason === 'max_tokens',
         },
         usage: {
@@ -1616,6 +1621,7 @@ export class Membrane {
     let totalUsage: BasicUsage = { inputTokens: 0, outputTokens: 0 };
     const contentBlocks: ContentBlock[] = [];
     let lastStopReason: StopReason = 'end_turn';
+    let lastStopSequence: string | undefined;
     let rawRequest: unknown;
     let rawResponse: unknown;
 
@@ -1739,6 +1745,7 @@ export class Membrane {
 
         rawResponse = streamResult.raw;
         lastStopReason = this.mapStopReason(streamResult.stopReason);
+        lastStopSequence = streamResult.stopSequence ?? undefined;
 
         // Accumulate usage
         totalUsage.inputTokens += streamResult.usage.inputTokens;
@@ -2008,7 +2015,8 @@ export class Membrane {
         rawResponse,
         executedToolCalls,
         executedToolResults,
-        initialBlockType
+        initialBlockType,
+        lastStopSequence
       );
 
       stream.emit({ type: 'complete', response });
@@ -2048,6 +2056,7 @@ export class Membrane {
     let toolDepth = 0;
     let totalUsage: BasicUsage = { inputTokens: 0, outputTokens: 0 };
     let lastStopReason: StopReason = 'end_turn';
+    let lastStopSequence: string | undefined;
     let rawRequest: unknown;
     let rawResponse: unknown;
 
@@ -2109,6 +2118,7 @@ export class Membrane {
 
         rawResponse = streamResult.raw;
         lastStopReason = this.mapStopReason(streamResult.stopReason);
+        lastStopSequence = streamResult.stopSequence ?? undefined;
 
         // Accumulate usage
         totalUsage.inputTokens += streamResult.usage.inputTokens;
@@ -2206,6 +2216,7 @@ export class Membrane {
         details: {
           stop: {
             reason: lastStopReason,
+            triggeredSequence: lastStopSequence,
             wasTruncated: lastStopReason === 'max_tokens',
           },
           usage: { ...totalUsage },
