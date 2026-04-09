@@ -1639,7 +1639,7 @@ export class Membrane {
     const formatter = this.formatter;
     const parser = formatter.createStreamParser();
     let toolDepth = 0;
-    let totalUsage: BasicUsage = { inputTokens: 0, outputTokens: 0 };
+    let totalUsage: DetailedUsage = { inputTokens: 0, outputTokens: 0 };
     const contentBlocks: ContentBlock[] = [];
     let lastStopReason: StopReason = 'end_turn';
     let lastStopSequence: string | undefined;
@@ -1768,9 +1768,15 @@ export class Membrane {
         lastStopReason = this.mapStopReason(streamResult.stopReason);
         lastStopSequence = streamResult.stopSequence ?? undefined;
 
-        // Accumulate usage
+        // Accumulate usage (including cache metrics)
         totalUsage.inputTokens += streamResult.usage.inputTokens;
         totalUsage.outputTokens += streamResult.usage.outputTokens;
+        if (streamResult.usage.cacheCreationTokens) {
+          totalUsage.cacheCreationTokens = (totalUsage.cacheCreationTokens ?? 0) + streamResult.usage.cacheCreationTokens;
+        }
+        if (streamResult.usage.cacheReadTokens) {
+          totalUsage.cacheReadTokens = (totalUsage.cacheReadTokens ?? 0) + streamResult.usage.cacheReadTokens;
+        }
         if (emitUsage) {
           stream.emit({ type: 'usage', usage: { ...totalUsage } });
         }
@@ -2075,7 +2081,7 @@ export class Membrane {
     } = options;
 
     let toolDepth = 0;
-    let totalUsage: BasicUsage = { inputTokens: 0, outputTokens: 0 };
+    let totalUsage: DetailedUsage = { inputTokens: 0, outputTokens: 0 };
     let lastStopReason: StopReason = 'end_turn';
     let lastStopSequence: string | undefined;
     let rawRequest: unknown;
@@ -2141,9 +2147,15 @@ export class Membrane {
         lastStopReason = this.mapStopReason(streamResult.stopReason);
         lastStopSequence = streamResult.stopSequence ?? undefined;
 
-        // Accumulate usage
+        // Accumulate usage (including cache metrics)
         totalUsage.inputTokens += streamResult.usage.inputTokens;
         totalUsage.outputTokens += streamResult.usage.outputTokens;
+        if (streamResult.usage.cacheCreationTokens) {
+          totalUsage.cacheCreationTokens = (totalUsage.cacheCreationTokens ?? 0) + streamResult.usage.cacheCreationTokens;
+        }
+        if (streamResult.usage.cacheReadTokens) {
+          totalUsage.cacheReadTokens = (totalUsage.cacheReadTokens ?? 0) + streamResult.usage.cacheReadTokens;
+        }
         if (emitUsage) {
           stream.emit({ type: 'usage', usage: { ...totalUsage } });
         }
