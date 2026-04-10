@@ -964,10 +964,13 @@ export class Membrane {
     const assistantName = request.assistantParticipant
       ?? this.config.assistantParticipant ?? 'Claude';
 
+    const promptCaching = request.promptCaching ?? true;
+    const cacheControl = promptCaching ? { type: 'ephemeral' as const, ...(request.cacheTtl ? { ttl: request.cacheTtl } : {}) } : undefined;
+
     for (const msg of messages) {
       const isAssistant = msg.participant === assistantName;
       const role = isAssistant ? 'assistant' : 'user';
-      
+
       // Convert content blocks
       const content: any[] = [];
       for (const block of msg.content) {
@@ -1009,19 +1012,42 @@ export class Membrane {
           }
         }
       }
-      
+
+      // Apply cache_control to last block of messages with cacheBreakpoint
+      if (msg.cacheBreakpoint && cacheControl && content.length > 0) {
+        content[content.length - 1].cache_control = cacheControl;
+      }
+
       providerMessages.push({ role, content });
     }
     
     // Convert tools to provider format.
     // Native tool names must match ^[a-zA-Z0-9_-]{1,128}$ — sanitize colons
     // from the module:tool namespace convention. Reversed in parseProviderContent.
-    const tools = request.tools?.map(tool => ({
-      name: sanitizeToolName(tool.name),
-      description: tool.description,
-      input_schema: tool.inputSchema,
-    }));
-    
+    const tools = request.tools?.map((tool, idx) => {
+      const t: Record<string, unknown> = {
+        name: sanitizeToolName(tool.name),
+        description: tool.description,
+        input_schema: tool.inputSchema,
+      };
+      // Cache the tool list — mark the last tool with cache_control
+      if (cacheControl && request.tools && idx === request.tools.length - 1) {
+        t.cache_control = cacheControl;
+      }
+      return t;
+    });
+
+    // Wrap system prompt with cache_control if prompt caching is enabled
+    let system: unknown = request.system;
+    if (cacheControl && typeof system === 'string' && system.length > 0) {
+      system = [{ type: 'text', text: system, cache_control: cacheControl }];
+    } else if (cacheControl && Array.isArray(system) && system.length > 0) {
+      const blocks = system as Record<string, unknown>[];
+      system = blocks.map((block, idx) =>
+        idx === blocks.length - 1 ? { ...block, cache_control: cacheControl } : block
+      );
+    }
+
     // Build thinking config for native extended thinking
     const thinking = request.config.thinking?.enabled
       ? {
@@ -1038,7 +1064,7 @@ export class Membrane {
       maxTokens: request.config.maxTokens,
       temperature,
       messages: providerMessages,
-      system: request.system,
+      system,
       tools,
       thinking,
       extra: request.providerParams,
