@@ -100,6 +100,9 @@ assert(getDefaultPricing('claude-haiku-4-5-20251001') !== undefined, 'claude-hai
 assert(getDefaultPricing('gpt-4o-2024-08-06') !== undefined, 'gpt-4o matched');
 assert(getDefaultPricing('gpt-4o-mini-2024-07-18') !== undefined, 'gpt-4o-mini matched');
 
+// Unversioned aliases
+assert(getDefaultPricing('gpt-4o') !== undefined, 'bare gpt-4o matched');
+
 // Unknown models
 assert(getDefaultPricing('llama-3-70b') === undefined, 'unknown model returns undefined');
 assert(getDefaultPricing('') === undefined, 'empty string returns undefined');

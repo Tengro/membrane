@@ -46,6 +46,10 @@ const PRICING_TABLE: Array<{ prefix: string; pricing: ModelPricing }> = [
     pricing: { inputPerMillion: 2.50, outputPerMillion: 10, cacheReadPerMillion: 1.25, currency: 'USD' },
   },
   {
+    prefix: 'gpt-4o',
+    pricing: { inputPerMillion: 2.50, outputPerMillion: 10, cacheReadPerMillion: 1.25, currency: 'USD' },
+  },
+  {
     prefix: 'gpt-4o-mini',
     pricing: { inputPerMillion: 0.15, outputPerMillion: 0.60, cacheReadPerMillion: 0.075, currency: 'USD' },
   },
