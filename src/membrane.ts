@@ -382,6 +382,7 @@ export class Membrane {
           },
           {
             signal,
+            normalizedRequest: request,
             onRequest: (req) => {
               rawRequest = req;
               onRequest?.(req);
@@ -788,6 +789,7 @@ export class Membrane {
           },
           {
             signal,
+            normalizedRequest: request,
             onRequest: (req) => {
               rawRequest = req;
               onRequest?.(req);
@@ -1125,6 +1127,23 @@ export class Membrane {
   // ==========================================================================
 
   /**
+   * Apply the configured `beforeRequest` hook to a provider-format request.
+   * Returns the (possibly modified) request, or the original if no hook is
+   * configured. This is the single point that all request-build sites should
+   * route through before invoking the adapter, so observers / mutators
+   * (logging, redaction, model rewriting) see every API call regardless of
+   * whether it came from `complete()`, `stream()`, or `streamYielding()`.
+   */
+  private async applyBeforeRequestHook(
+    normalizedRequest: NormalizedRequest,
+    providerRequest: any,
+  ): Promise<any> {
+    if (!this.config.hooks?.beforeRequest) return providerRequest;
+    const result = await this.config.hooks.beforeRequest(normalizedRequest, providerRequest);
+    return result ?? providerRequest;
+  }
+
+  /**
    * Extract base provider params from config, with thinking temperature enforcement.
    * Used by transformRequest, buildContinuationRequest, and buildContinuationRequestWithImages.
    */
@@ -1195,9 +1214,25 @@ export class Membrane {
   private async streamOnce(
     request: any,
     callbacks: { onChunk: (chunk: string) => void; onContentBlock?: (index: number, block: unknown) => void },
-    options: { signal?: AbortSignal; timeoutMs?: number; idleTimeoutMs?: number; onRequest?: (rawRequest: unknown) => void }
+    options: {
+      signal?: AbortSignal;
+      timeoutMs?: number;
+      idleTimeoutMs?: number;
+      onRequest?: (rawRequest: unknown) => void;
+      /**
+       * The original NormalizedRequest, threaded through so the
+       * `beforeRequest` hook can see both shapes (normalized + provider).
+       * Call sites that don't pass this still work — the hook just won't
+       * fire for that particular call. New call sites should pass it.
+       */
+      normalizedRequest?: NormalizedRequest;
+    }
   ) {
-    return await this.adapter.stream(request, callbacks, options);
+    let finalRequest = request;
+    if (options.normalizedRequest) {
+      finalRequest = await this.applyBeforeRequestHook(options.normalizedRequest, request);
+    }
+    return await this.adapter.stream(finalRequest, callbacks, options);
   }
 
   private buildContinuationRequest(
@@ -1802,6 +1837,7 @@ export class Membrane {
             signal: stream.signal,
             timeoutMs: options.timeoutMs,
             idleTimeoutMs: options.idleTimeoutMs,
+            normalizedRequest: request,
             onRequest: (req: unknown) => { rawRequest = req; },
           }
         );
@@ -2191,6 +2227,7 @@ export class Membrane {
             signal: stream.signal,
             timeoutMs: options.timeoutMs,
             idleTimeoutMs: options.idleTimeoutMs,
+            normalizedRequest: request,
             onRequest: (req: unknown) => { rawRequest = req; },
           }
         );
