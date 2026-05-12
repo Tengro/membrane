@@ -100,11 +100,12 @@ export class Membrane {
       try {
         const { providerRequest, prefillResult } = this.transformRequest(request, options.formatter);
 
-        // Call beforeRequest hook
-        let finalRequest = providerRequest;
-        if (this.config.hooks?.beforeRequest) {
-          finalRequest = await this.config.hooks.beforeRequest(request, providerRequest) ?? providerRequest;
-        }
+        // Route through the single canonical hook helper so any future
+        // change to hook semantics (logging, retry interaction, error
+        // handling) applies to both complete() and the streaming paths.
+        // Cast back to the local provider-request shape: the hook returns
+        // `unknown` deliberately, and we acknowledge the cast at the boundary.
+        const finalRequest = (await this.applyBeforeRequestHook(request, providerRequest)) as typeof providerRequest;
 
         const providerResponse = await this.adapter.complete(finalRequest, {
           signal: options.signal,
@@ -1136,8 +1137,8 @@ export class Membrane {
    */
   private async applyBeforeRequestHook(
     normalizedRequest: NormalizedRequest,
-    providerRequest: any,
-  ): Promise<any> {
+    providerRequest: unknown,
+  ): Promise<unknown> {
     if (!this.config.hooks?.beforeRequest) return providerRequest;
     const result = await this.config.hooks.beforeRequest(normalizedRequest, providerRequest);
     return result ?? providerRequest;
@@ -1222,17 +1223,22 @@ export class Membrane {
       /**
        * The original NormalizedRequest, threaded through so the
        * `beforeRequest` hook can see both shapes (normalized + provider).
-       * Call sites that don't pass this still work — the hook just won't
-       * fire for that particular call. New call sites should pass it.
+       * Required: forgetting this is the failure mode the helper exists to
+       * prevent (the streaming paths previously skipped the hook entirely).
+       * If a future caller genuinely needs to bypass the hook, introduce a
+       * separate `streamOnceWithoutHook` so the bypass is intentional.
        */
-      normalizedRequest?: NormalizedRequest;
+      normalizedRequest: NormalizedRequest;
     }
   ) {
-    let finalRequest = request;
-    if (options.normalizedRequest) {
-      finalRequest = await this.applyBeforeRequestHook(options.normalizedRequest, request);
-    }
-    return await this.adapter.stream(finalRequest, callbacks, options);
+    // Strip `normalizedRequest` before forwarding to the adapter — it's
+    // not part of `ProviderRequestOptions` and TypeScript's structural
+    // compatibility won't catch the excess field (checked only on object
+    // literals, not on variables). Leaving it in would silently leak the
+    // normalized form into every adapter's options.
+    const { normalizedRequest, ...adapterOptions } = options;
+    const finalRequest = (await this.applyBeforeRequestHook(normalizedRequest, request)) as typeof request;
+    return await this.adapter.stream(finalRequest, callbacks, adapterOptions);
   }
 
   private buildContinuationRequest(
