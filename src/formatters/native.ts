@@ -28,6 +28,7 @@ import type {
   BlockEvent,
   StreamEmission,
 } from './types.js';
+import { normalizeToolPairs } from './normalize-tool-pairs.js';
 
 // ============================================================================
 // Configuration
@@ -245,8 +246,17 @@ export class NativeFormatter implements PrefillFormatter {
       }
     }
 
+    // Tool-pair normalizer: wire-boundary safety net for Anthropic's
+    // structural rules on tool cycles. See `normalize-tool-pairs.ts`
+    // for the full rationale. Runs BEFORE mergeConsecutiveRoles so the
+    // merge sees role-correct envelopes.
+    const normalized = normalizeToolPairs(providerMessages, {
+      pendingToolCallIds: options.pendingToolCallIds,
+      onEvent: options.onNormalize,
+    });
+
     // Merge consecutive same-role messages (API requires alternating)
-    const mergedMessages = this.mergeConsecutiveRoles(providerMessages);
+    const mergedMessages = this.mergeConsecutiveRoles(normalized.messages);
 
     // Build system content with optional cache control
     let systemContent: unknown;
@@ -279,6 +289,7 @@ export class NativeFormatter implements PrefillFormatter {
       systemContent,
       stopSequences: additionalStopSequences ?? [],
       nativeTools,
+      ready: normalized.ready,
     };
   }
 
