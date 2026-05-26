@@ -16,11 +16,13 @@
  * output is shipped, so producer-side bugs cannot leak the same 400 family
  * (compression-bug 5/6/7/8/9, agent-framework #37, 2026-05-22 miner stall).
  *
- * Algorithm overview (six phases): reclassify blocks by required role,
+ * Algorithm overview (eight phases): reclassify blocks by required role,
  * reflow into role-correct envelopes, hoist matching tool_results across
  * the assistant→user boundary, evict interlopers wedged between use and
  * result, synthesize `[pending]` results for trailing orphans (or signal
- * not-ready when the id is in the caller-supplied pending set), validate.
+ * not-ready when the id is in the caller-supplied pending set), drop
+ * empty envelopes, prepend a synthetic `[continuing]` user envelope when
+ * the first envelope ended up assistant-role, validate.
  */
 
 import type { ProviderMessage as LooseProviderMessage } from './types.js';
@@ -123,15 +125,34 @@ export function normalizeToolPairs(
   // Phase 5.5: suppress cache_control on/after any envelope containing
   // a synthetic block, so cache keys don't get invalidated when the
   // real result arrives in a later round.
+  //
+  // The suppression itself happens here (we know which envelope is the
+  // first synthetic by its position in the current array), but the
+  // `cache_suppressed_for_synthetic` telemetry is deferred until after
+  // phase 6 (which can drop empty envelopes before the synthetic) and
+  // phase 7 (which can prepend a `[continuing]` envelope, shifting
+  // everything by +1). The event's `envelopeIndex` must refer to the
+  // final output array so consumers can index back into it reliably.
+  // We pin the envelope by reference and recompute the index after
+  // those phases settle.
   // ---------------------------------------------------------------------
+  let pendingCacheSuppressionRef: Envelope | null = null;
   if (orphanRes.firstSyntheticEnvelope !== null) {
-    suppressCacheControlFrom(envelopes, orphanRes.firstSyntheticEnvelope, onEvent);
+    const ref = envelopes[orphanRes.firstSyntheticEnvelope]!;
+    const suppressed = suppressCacheControlFrom(envelopes, orphanRes.firstSyntheticEnvelope);
+    if (suppressed) {
+      pendingCacheSuppressionRef = ref;
+    }
   }
 
   // ---------------------------------------------------------------------
   // Phase 6: drop empty envelopes (can arise from phase 4 dropping or
   // phase 3 hoisting). We deliberately do NOT merge consecutive
   // same-role envelopes here — that's the formatter's job.
+  //
+  // The synthetic-bearing envelope (held by `pendingCacheSuppressionRef`)
+  // cannot be dropped here — phase 5 unshifts its synthetic block onto
+  // that envelope's content, so it's guaranteed non-empty.
   // ---------------------------------------------------------------------
   envelopes = envelopes.filter((e) => e.content.length > 0);
 
@@ -166,11 +187,35 @@ export function normalizeToolPairs(
   // second time (envelope[0] is user, gate doesn't fire).
   // ---------------------------------------------------------------------
   if (envelopes.length > 0 && envelopes[0]!.role === 'assistant') {
-    const originalFirstRole: 'user' | 'assistant' | 'empty' =
-      input.length > 0 ? input[0]!.role : 'empty';
+    // `input` is guaranteed non-empty here: rebuildEnvelopes only
+    // produces envelopes when iterating input messages, so a non-empty
+    // envelopes implies a non-empty input.
+    const originalFirstRole = input[0]!.role;
     const leadingBlockTypes = envelopes[0]!.content.map((b) => b.type);
     envelopes.unshift({ role: 'user', content: [{ type: 'text', text: '[continuing]' }] });
     onEvent({ kind: 'leading_user_synthesized', originalFirstRole, leadingBlockTypes });
+  }
+
+  // ---------------------------------------------------------------------
+  // Deferred phase 5.5 telemetry: emit `cache_suppressed_for_synthetic`
+  // now that index-mutating phases (6, 7) have settled. The envelope
+  // reference pinned in phase 5.5 survives both — phase 6 can't drop it
+  // (the synthetic block keeps it non-empty), and phase 7 either leaves
+  // it in place or shifts it by +1 via unshift.
+  // ---------------------------------------------------------------------
+  if (pendingCacheSuppressionRef !== null) {
+    const envelopeIndex = envelopes.indexOf(pendingCacheSuppressionRef);
+    // Assertion: indexOf must succeed. Phases 6 and 7 only filter/prepend;
+    // neither can remove an envelope holding a synthetic block.
+    if (envelopeIndex < 0) {
+      throw new MembraneNormalizerError(
+        `Phase 5.5 envelope reference vanished between phase 6 and phase 7 — ` +
+          `internal bug: synthetic-bearing envelope should be reachable after both phases.`,
+        input.map(cloneMsg),
+        envelopes.map(toProviderMessage),
+      );
+    }
+    onEvent({ kind: 'cache_suppressed_for_synthetic', envelopeIndex });
   }
 
   // ---------------------------------------------------------------------
@@ -488,8 +533,7 @@ function resolveOrphans(
 function suppressCacheControlFrom(
   envelopes: Envelope[],
   startIndex: number,
-  onEvent: (e: NormalizeEvent) => void,
-): void {
+): boolean {
   // Strip cache_control from blocks at-or-after startIndex. We must NOT
   // mutate the caller's input blocks (envelopes share references with
   // the input via rebuildEnvelopes), so clone-on-write: replace any
@@ -497,6 +541,10 @@ function suppressCacheControlFrom(
   // The envelope's content array is replaced wholesale via .map; this
   // is the only place in the normalizer that creates new block objects
   // out of existing ones (synthetics aside).
+  //
+  // Returns whether any block was actually suppressed, so the caller
+  // can decide whether to emit telemetry. Emission is deferred until
+  // after phases 6 and 7 settle the final envelope ordering.
   let suppressed = false;
   for (let i = startIndex; i < envelopes.length; i++) {
     const env = envelopes[i]!;
@@ -509,9 +557,7 @@ function suppressCacheControlFrom(
       return rest as ProviderBlock;
     });
   }
-  if (suppressed) {
-    onEvent({ kind: 'cache_suppressed_for_synthetic', envelopeIndex: startIndex });
-  }
+  return suppressed;
 }
 
 function validate(

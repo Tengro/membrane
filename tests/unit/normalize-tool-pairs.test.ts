@@ -516,6 +516,56 @@ describe('normalizeToolPairs', () => {
       expect(events.some((e) => e.kind === 'cache_suppressed_for_synthetic')).toBe(true);
     });
 
+    it('cache_suppressed_for_synthetic.envelopeIndex stays correct after phase-7 prepend', () => {
+      // Regression: when phase 5 synthesizes a [pending] result AND phase 7
+      // prepends a [continuing] envelope (both fire for an assistant-first
+      // input with an unmatched tool_use), the cache-suppression event's
+      // envelopeIndex must refer to the FINAL output array, not the
+      // pre-phase-7 working array.
+      const cached = (block: ProviderBlock): ProviderBlock => ({
+        ...block,
+        cache_control: { type: 'ephemeral' },
+      });
+      const input: ProviderMessage[] = [
+        // Assistant-first (triggers phase 7) with an orphan tool_use
+        // (triggers phase 5 synthesis + phase 5.5 cache suppression).
+        assistant(u('A')),
+        user(cached(t('would-be cache breakpoint after the synthetic'))),
+        assistant(t('continuing')),
+      ];
+      const { events, onEvent } = collectEvents();
+      const out = normalize(input, { onEvent });
+
+      // Both events must fire.
+      const leadEv = events.find((e) => e.kind === 'leading_user_synthesized');
+      const cacheEv = events.find((e) => e.kind === 'cache_suppressed_for_synthetic') as
+        | { envelopeIndex: number }
+        | undefined;
+      expect(leadEv).toBeDefined();
+      expect(cacheEv).toBeDefined();
+
+      // The cache-suppressed envelope index must point at an envelope
+      // actually containing a synthetic tool_result in the FINAL output.
+      const idx = cacheEv!.envelopeIndex;
+      expect(idx).toBeGreaterThanOrEqual(0);
+      expect(idx).toBeLessThan(out.messages.length);
+      const targetEnv = out.messages[idx]!;
+      const hasSyntheticPending = targetEnv.content.some(
+        (b) =>
+          b.type === 'tool_result' &&
+          (b as ProviderBlock & { content?: unknown }).content === '[pending]',
+      );
+      expect(hasSyntheticPending).toBe(true);
+
+      // And it must NOT point at the synthesized [continuing] user turn.
+      expect(targetEnv.role).toBe('user');
+      const isContinuing =
+        targetEnv.content.length === 1 &&
+        targetEnv.content[0]!.type === 'text' &&
+        (targetEnv.content[0] as ProviderBlock & { text: string }).text === '[continuing]';
+      expect(isContinuing).toBe(false);
+    });
+
     it('leaves cache_control alone when no synthetic was needed', () => {
       const cached = (block: ProviderBlock): ProviderBlock => ({
         ...block,

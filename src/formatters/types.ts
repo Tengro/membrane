@@ -125,7 +125,10 @@ export type NormalizeEvent =
        *                    new assistant envelope). Usually benign.
        *   - `'assistant'`→ producer shipped an assistant-first messages
        *                    list. Real producer bug worth investigating.
-       *   - `'empty'`    → degenerate single-assistant input.
+       *
+       * (Empty input never reaches this event: `rebuildEnvelopes([])`
+       * returns `[]`, and the phase-7 gate requires a non-empty envelope
+       * list. So `input[0]` is always defined when this fires.)
        *
        * `leadingBlockTypes` is the block-type list of the now-second
        * envelope (i.e. what came right after the synthesized user turn),
@@ -133,7 +136,7 @@ export type NormalizeEvent =
        * vs. `['text', 'tool_use']`).
        */
       kind: 'leading_user_synthesized';
-      originalFirstRole: 'user' | 'assistant' | 'empty';
+      originalFirstRole: 'user' | 'assistant';
       leadingBlockTypes: string[];
     };
 
