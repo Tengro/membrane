@@ -111,7 +111,31 @@ export type NormalizeEvent =
   | { kind: 'synthetic_pending_result'; toolUseId: string; reason: 'trailing' | 'mid_stream' }
   | { kind: 'orphan_tool_result_textified'; toolUseId: string }
   | { kind: 'pending_in_flight'; toolUseId: string }
-  | { kind: 'cache_suppressed_for_synthetic'; envelopeIndex: number };
+  | { kind: 'cache_suppressed_for_synthetic'; envelopeIndex: number }
+  | {
+      /**
+       * Fires when the first envelope after re-roling is assistant and a
+       * synthetic `[continuing]` user envelope had to be prepended to
+       * satisfy Anthropic's `messages[0].role === 'user'` requirement.
+       *
+       * `originalFirstRole` distinguishes the two causes a consumer might
+       * want to alert on separately:
+       *   - `'user'`     → re-roling artifact (a strict-role block lived
+       *                    under a user-role message and was moved to a
+       *                    new assistant envelope). Usually benign.
+       *   - `'assistant'`→ producer shipped an assistant-first messages
+       *                    list. Real producer bug worth investigating.
+       *   - `'empty'`    → degenerate single-assistant input.
+       *
+       * `leadingBlockTypes` is the block-type list of the now-second
+       * envelope (i.e. what came right after the synthesized user turn),
+       * useful for classifying re-roling causes (e.g. `['thinking']`
+       * vs. `['text', 'tool_use']`).
+       */
+      kind: 'leading_user_synthesized';
+      originalFirstRole: 'user' | 'assistant' | 'empty';
+      leadingBlockTypes: string[];
+    };
 
 // ============================================================================
 // Build Result

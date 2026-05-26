@@ -130,29 +130,58 @@ export function normalizeToolPairs(
 
   // ---------------------------------------------------------------------
   // Phase 6: drop empty envelopes (can arise from phase 4 dropping or
-  // phase 3 hoisting), repair first-message-must-be-user, validate. We
-  // deliberately do NOT merge consecutive same-role envelopes here —
-  // that's the formatter's job.
+  // phase 3 hoisting). We deliberately do NOT merge consecutive
+  // same-role envelopes here — that's the formatter's job.
   // ---------------------------------------------------------------------
   envelopes = envelopes.filter((e) => e.content.length > 0);
 
-  // First-message-must-be-user repair: only repair the case where the
-  // original input's first message WAS user, but re-roling moved blocks
-  // to a leading assistant envelope (e.g. misplaced thinking block).
-  // If the producer genuinely shipped an assistant-first conversation,
-  // that's a real bug and validate() will throw.
-  const originalFirstRole = input.length > 0 ? input[0]!.role : 'user';
-  if (
-    envelopes.length > 0 &&
-    envelopes[0]!.role === 'assistant' &&
-    originalFirstRole === 'user'
-  ) {
+  // ---------------------------------------------------------------------
+  // Phase 7: ensure first envelope is user-role.
+  //
+  // Anthropic requires `messages[0].role === 'user'`. The leading
+  // envelope can become assistant for two distinct reasons:
+  //
+  //   (a) Re-roling artifact — a strict-role block (thinking, tool_use)
+  //       lived under a user-role input message and phase 1+2 moved it
+  //       to a new leading assistant envelope. `originalFirstRole`
+  //       is `'user'`.
+  //
+  //   (b) Producer bug — a context strategy genuinely selected an
+  //       assistant message as the first message of its compiled view
+  //       (the 2026-05-26 reviewer postmortem: PassthroughStrategy
+  //       `selectFromEnd` cut on an assistant turn). `originalFirstRole`
+  //       is `'assistant'`.
+  //
+  // Both cases get the same repair (prepend a `[continuing]` user
+  // envelope) because deletion would lose content in case (a) — the
+  // re-roled blocks are real conversation content the producer
+  // expected to ship. The synthetic costs a leading cache miss
+  // (deterministic literal, so idempotent across identical inputs)
+  // but preserves API correctness and producer simplicity. We emit
+  // a warn-level event so telemetry can distinguish the causes and
+  // alert on (b) without coupling control flow to attribution.
+  //
+  // Idempotency: the synthetic content is a fixed literal. Running
+  // normalize twice on the same input produces identical output the
+  // second time (envelope[0] is user, gate doesn't fire).
+  // ---------------------------------------------------------------------
+  if (envelopes.length > 0 && envelopes[0]!.role === 'assistant') {
+    const originalFirstRole: 'user' | 'assistant' | 'empty' =
+      input.length > 0 ? input[0]!.role : 'empty';
+    const leadingBlockTypes = envelopes[0]!.content.map((b) => b.type);
     envelopes.unshift({ role: 'user', content: [{ type: 'text', text: '[continuing]' }] });
+    onEvent({ kind: 'leading_user_synthesized', originalFirstRole, leadingBlockTypes });
   }
 
-  // Validate. When `ready === false` we intentionally have unmatched
-  // tool_uses — but ONLY the ones in `pending` are allowed to remain
-  // unsynthesized. Any other gap is a bug in phase 5 and must throw.
+  // ---------------------------------------------------------------------
+  // Phase 8: validate. When `ready === false` we intentionally have
+  // unmatched tool_uses — but ONLY the ones in `pending` are allowed to
+  // remain unsynthesized. Any other gap is a bug in phase 5 and must
+  // throw. The first-message-must-be-user branch should be unreachable
+  // after phase 7; it remains as defense-in-depth against a future
+  // phase introducing a leading assistant envelope without firing
+  // phase 7.
+  // ---------------------------------------------------------------------
   validate(envelopes, input, pending);
 
   return { messages: envelopes.map(toProviderMessage), ready };
