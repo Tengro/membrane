@@ -430,15 +430,22 @@ function toAnthropicToolResultContent(
   for (const block of blocks) {
     if (block.type === 'text') {
       out.push({ type: 'text', text: block.text });
-    } else if (block.type === 'image' && block.source.type === 'base64') {
-      out.push({
-        type: 'image',
-        source: {
-          type: 'base64',
-          media_type: block.source.mediaType as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
-          data: block.source.data,
-        },
-      });
+    } else if (block.type === 'image') {
+      if (block.source.type === 'base64') {
+        out.push({
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: block.source.mediaType as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
+            data: block.source.data,
+          },
+        });
+      } else if (block.source.type === 'url') {
+        out.push({
+          type: 'image',
+          source: { type: 'url', url: block.source.url },
+        });
+      }
     }
   }
   return out;
