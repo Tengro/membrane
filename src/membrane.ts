@@ -385,6 +385,10 @@ export class Membrane {
           {
             signal,
             normalizedRequest: request,
+            // The tag-based parser tracks thinking via <thinking> tags — ask the
+            // provider to wrap native thinking deltas so they don't stream as
+            // visible text (see ProviderRequestOptions.wrapThinkingTags)
+            wrapThinkingTags: true,
             onRequest: (req) => {
               rawRequest = req;
               onRequest?.(req);
@@ -1266,6 +1270,8 @@ export class Membrane {
       timeoutMs?: number;
       idleTimeoutMs?: number;
       onRequest?: (rawRequest: unknown) => void;
+      /** See ProviderRequestOptions.wrapThinkingTags */
+      wrapThinkingTags?: boolean;
       /**
        * The original NormalizedRequest, threaded through so the
        * `beforeRequest` hook can see both shapes (normalized + provider).

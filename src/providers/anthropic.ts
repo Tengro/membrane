@@ -128,6 +128,13 @@ export class AnthropicAdapter implements ProviderAdapter {
       let currentBlockIndex = -1;
       let currentBlockContent = '';
       let currentBlockInputJson = '';
+      // When wrapThinkingTags is set (XML formatter path), native thinking
+      // deltas are wrapped in <thinking>...</thinking> on the chunk stream so
+      // the tag-based parser tracks them as thinking instead of visible text.
+      // Tag opened lazily on the first delta — display:'omitted' models emit
+      // thinking blocks with no thinking_delta at all (signature only).
+      const wrapThinkingTags = options?.wrapThinkingTags === true;
+      let thinkingTagOpen = false;
 
       for await (const event of stream) {
         resetIdleTimer();
@@ -152,6 +159,10 @@ export class AnthropicAdapter implements ProviderAdapter {
             callbacks.onChunk(chunk);
           } else if (event.delta.type === 'thinking_delta') {
             currentBlockContent += event.delta.thinking;
+            if (wrapThinkingTags && !thinkingTagOpen) {
+              callbacks.onChunk('<thinking>');
+              thinkingTagOpen = true;
+            }
             callbacks.onChunk(event.delta.thinking);
           } else if ((event.delta as { type: string }).type === 'signature_delta') {
             // Accumulate the cryptographic signature that authenticates this
@@ -176,6 +187,10 @@ export class AnthropicAdapter implements ProviderAdapter {
               block.text = currentBlockContent;
             } else if (block.type === 'thinking') {
               block.thinking = currentBlockContent;
+              if (thinkingTagOpen) {
+                callbacks.onChunk('</thinking>\n');
+                thinkingTagOpen = false;
+              }
             } else if (block.type === 'tool_use' && currentBlockInputJson) {
               try { block.input = JSON.parse(currentBlockInputJson); } catch { /* partial JSON */ }
             }
