@@ -1085,20 +1085,8 @@ export class Membrane {
       );
     }
 
-    // Build thinking config for native extended thinking
-    const nativeThinkingType = request.config.thinking?.type ?? 'enabled';
-    const thinking = request.config.thinking?.enabled
-      ? (nativeThinkingType === 'adaptive'
-        ? {
-            type: 'adaptive' as const,
-            ...(request.config.thinking.display ? { display: request.config.thinking.display } : {}),
-          }
-        : {
-            type: 'enabled' as const,
-            budget_tokens: request.config.thinking.budgetTokens ?? 5000,
-            ...(request.config.thinking.display ? { display: request.config.thinking.display } : {}),
-          })
-      : undefined;
+    // Build thinking config for native extended thinking (budget clamped to max_tokens)
+    const thinking = this.buildThinkingParam(request.config);
 
     // Anthropic requires temperature=1 when extended thinking is enabled
     const temperature = thinking ? 1 : request.config.temperature;
@@ -1183,22 +1171,10 @@ export class Membrane {
    * Used by transformRequest, buildContinuationRequest, and buildContinuationRequestWithImages.
    */
   private getBaseProviderParams(config: NormalizedRequest['config']) {
-    // Anthropic requires temperature=1 when extended thinking is enabled
-    const temperature = config.thinking?.enabled ? 1 : config.temperature;
     // Build thinking config for native extended thinking
-    const thinkingType = config.thinking?.type ?? 'enabled';
-    const thinking = config.thinking?.enabled
-      ? (thinkingType === 'adaptive'
-        ? {
-            type: 'adaptive' as const,
-            ...(config.thinking.display ? { display: config.thinking.display } : {}),
-          }
-        : {
-            type: 'enabled' as const,
-            budget_tokens: config.thinking!.budgetTokens ?? 5000,
-            ...(config.thinking.display ? { display: config.thinking.display } : {}),
-          })
-      : undefined;
+    const thinking = this.buildThinkingParam(config);
+    // Anthropic requires temperature=1 when extended thinking is enabled
+    const temperature = thinking ? 1 : config.temperature;
     return {
       model: config.model,
       maxTokens: config.maxTokens,
@@ -1210,6 +1186,36 @@ export class Membrane {
       repetitionPenalty: config.repetitionPenalty,
       thinking,
     };
+  }
+
+  /**
+   * Build the provider thinking parameter from config.
+   *
+   * For type 'enabled', the API requires max_tokens > budget_tokens and a
+   * minimum budget of 1024 — a misconfigured budget (e.g., default 10000 with
+   * max_tokens 4096) is clamped to fit. If no valid budget fits (max_tokens
+   * too small), thinking is omitted entirely rather than sending a request
+   * the API will reject.
+   */
+  private buildThinkingParam(config: NormalizedRequest['config']):
+    | { type: 'adaptive'; display?: 'summarized' | 'omitted' }
+    | { type: 'enabled'; budget_tokens: number; display?: 'summarized' | 'omitted' }
+    | undefined {
+    if (!config.thinking?.enabled) return undefined;
+
+    const display = config.thinking.display;
+    if ((config.thinking.type ?? 'enabled') === 'adaptive') {
+      return { type: 'adaptive', ...(display ? { display } : {}) };
+    }
+
+    const requested = config.thinking.budgetTokens ?? 5000;
+    const maxTokens = typeof config.maxTokens === 'number' ? config.maxTokens : undefined;
+    const budget = maxTokens !== undefined ? Math.min(requested, maxTokens - 1024) : requested;
+    if (budget < 1024) {
+      // Can't fit a valid thinking budget under max_tokens — skip thinking
+      return undefined;
+    }
+    return { type: 'enabled', budget_tokens: budget, ...(display ? { display } : {}) };
   }
 
   /**

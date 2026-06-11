@@ -48,9 +48,9 @@ describe('Temperature enforcement for thinking', () => {
     const request = makeRequest({
       config: {
         model: 'claude-haiku-4-5-20251001',
-        maxTokens: 1000,
+        maxTokens: 4096,
         temperature: 0.5,
-        thinking: { enabled: true, budgetTokens: 1000 },
+        thinking: { enabled: true, budgetTokens: 2048 },
       },
     });
 
@@ -93,9 +93,9 @@ describe('Temperature enforcement for thinking', () => {
     const request = makeRequest({
       config: {
         model: 'claude-haiku-4-5-20251001',
-        maxTokens: 1000,
+        maxTokens: 4096,
         temperature: 0.3,
-        thinking: { enabled: true, budgetTokens: 1000 },
+        thinking: { enabled: true, budgetTokens: 2048 },
       },
     });
 
@@ -105,6 +105,69 @@ describe('Temperature enforcement for thinking', () => {
     });
 
     expect(capturedRequest.temperature).toBe(1);
+  });
+
+  it('clamps thinking budget_tokens below max_tokens', async () => {
+    let capturedRequest: any;
+    const adapter = new MockAdapter({ defaultResponse: 'Hello' });
+    const membrane = new Membrane(adapter);
+
+    const request = makeRequest({
+      config: {
+        model: 'claude-sonnet-4-5-20250929',
+        maxTokens: 4096,
+        thinking: { enabled: true, budgetTokens: 10000 },  // exceeds max_tokens
+      },
+    });
+
+    await membrane.complete(request, {
+      onRequest: (req) => { capturedRequest = req; },
+    });
+
+    expect(capturedRequest.thinking).toEqual({ type: 'enabled', budget_tokens: 4096 - 1024 });
+  });
+
+  it('drops thinking entirely when no valid budget fits under max_tokens', async () => {
+    let capturedRequest: any;
+    const adapter = new MockAdapter({ defaultResponse: 'Hello' });
+    const membrane = new Membrane(adapter);
+
+    const request = makeRequest({
+      config: {
+        model: 'claude-sonnet-4-5-20250929',
+        maxTokens: 1000,  // can't fit minimum 1024 budget below this
+        temperature: 0.5,
+        thinking: { enabled: true, budgetTokens: 5000 },
+      },
+    });
+
+    await membrane.complete(request, {
+      onRequest: (req) => { capturedRequest = req; },
+    });
+
+    expect(capturedRequest.thinking).toBeUndefined();
+    // No thinking sent — temperature should NOT be forced to 1
+    expect(capturedRequest.temperature).toBe(0.5);
+  });
+
+  it('does not clamp adaptive thinking (no budget)', async () => {
+    let capturedRequest: any;
+    const adapter = new MockAdapter({ defaultResponse: 'Hello' });
+    const membrane = new Membrane(adapter);
+
+    const request = makeRequest({
+      config: {
+        model: 'claude-fable-5',
+        maxTokens: 1000,
+        thinking: { enabled: true, type: 'adaptive' as const, display: 'summarized' as const },
+      },
+    });
+
+    await membrane.complete(request, {
+      onRequest: (req) => { capturedRequest = req; },
+    });
+
+    expect(capturedRequest.thinking).toEqual({ type: 'adaptive', display: 'summarized' });
   });
 });
 
