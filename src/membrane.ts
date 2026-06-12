@@ -420,20 +420,12 @@ export class Membrane {
                 data: (block as any).data,
                 mimeType: (block as any).mimeType,
               } as ContentBlock);
-            } else if (block.type === 'thinking') {
-              // Native thinking block from the provider — carries the signature
-              // (encrypted full reasoning). Captured so consumers can persist and
-              // round-trip it for reasoning continuity. Includes signature-only
-              // blocks (display:'omitted' returns an empty thinking field).
-              providerThinkingBlocks.push({
-                type: 'thinking',
-                thinking: (block as any).thinking ?? '',
-                ...((block as any).signature ? { signature: (block as any).signature } : {}),
-              } as ContentBlock);
-            } else if (block.type === 'redacted_thinking') {
-              providerThinkingBlocks.push({ ...(block as any) } as ContentBlock);
             }
           }
+          // Native thinking blocks carry the signature (encrypted full
+          // reasoning) — captured so consumers can persist and round-trip
+          // them for reasoning continuity.
+          this.captureProviderThinkingBlocks(streamResult.content, providerThinkingBlocks);
         }
 
         rawResponse = streamResult.raw;
@@ -723,31 +715,7 @@ export class Membrane {
       }
 
       // Merge provider thinking signatures into parser-derived thinking blocks
-      // (matched in stream order), and prepend any leftover provider blocks —
-      // signature-only thinking (display:'omitted') never appears in the text
-      // stream, so the parser produces no block for it. redacted_thinking
-      // blocks are always prepended verbatim.
-      if (providerThinkingBlocks.length > 0) {
-        const parsedThinking = response.content.filter(
-          (b) => b.type === 'thinking'
-        ) as Array<{ type: 'thinking'; thinking: string; signature?: string }>;
-
-        const providerThinking = providerThinkingBlocks.filter((b) => b.type === 'thinking');
-        const redacted = providerThinkingBlocks.filter((b) => b.type === 'redacted_thinking');
-
-        const matched = Math.min(providerThinking.length, parsedThinking.length);
-        for (let i = 0; i < matched; i++) {
-          const sig = (providerThinking[i] as { signature?: string }).signature;
-          if (sig) {
-            parsedThinking[i]!.signature = sig;
-          }
-        }
-
-        const leftover = providerThinking.slice(matched);
-        if (leftover.length > 0 || redacted.length > 0) {
-          response.content.unshift(...leftover, ...redacted);
-        }
-      }
+      this.mergeProviderThinkingBlocks(response.content, providerThinkingBlocks);
 
       return response;
     } catch (error) {
@@ -1182,9 +1150,12 @@ export class Membrane {
         } else if (item.type === 'thinking') {
           blocks.push({
             type: 'thinking',
-            thinking: item.thinking,
-            signature: item.signature,
+            thinking: item.thinking ?? '',
+            ...(item.signature ? { signature: item.signature } : {}),
           });
+        } else if (item.type === 'redacted_thinking') {
+          // Pass through verbatim — carries the encrypted `data` payload
+          blocks.push({ ...item } as ContentBlock);
         } else if (item.type === 'generated_image') {
           blocks.push({
             type: 'generated_image',
@@ -1195,12 +1166,73 @@ export class Membrane {
       }
       return blocks;
     }
-    
+
     if (typeof content === 'string') {
       return [{ type: 'text', text: content }];
     }
-    
+
     return [];
+  }
+
+  /**
+   * Capture native thinking / redacted_thinking blocks from a provider
+   * response so they can be merged into parser-derived content (XML paths,
+   * where the parser only sees text). Includes signature-only thinking
+   * blocks (display:'omitted' returns an empty thinking field).
+   */
+  private captureProviderThinkingBlocks(
+    providerContent: unknown,
+    sink: ContentBlock[]
+  ): void {
+    if (!Array.isArray(providerContent)) return;
+    for (const block of providerContent) {
+      if (block?.type === 'thinking') {
+        sink.push({
+          type: 'thinking',
+          thinking: (block as any).thinking ?? '',
+          ...((block as any).signature ? { signature: (block as any).signature } : {}),
+        } as ContentBlock);
+      } else if (block?.type === 'redacted_thinking') {
+        sink.push({ ...(block as any) } as ContentBlock);
+      }
+    }
+  }
+
+  /**
+   * Merge provider thinking signatures into parser-derived thinking blocks
+   * (matched in stream order), and prepend any leftover provider blocks —
+   * signature-only thinking (display:'omitted') never appears in the text
+   * stream, so the parser produces no block for it. redacted_thinking
+   * blocks are always prepended verbatim.
+   *
+   * Mutates `content` in place. Shared by the XML stream paths
+   * (streamWithXmlTools and runXmlToolsYielding).
+   */
+  private mergeProviderThinkingBlocks(
+    content: ContentBlock[],
+    providerThinkingBlocks: ContentBlock[]
+  ): void {
+    if (providerThinkingBlocks.length === 0) return;
+
+    const parsedThinking = content.filter(
+      (b) => b.type === 'thinking'
+    ) as Array<{ type: 'thinking'; thinking: string; signature?: string }>;
+
+    const providerThinking = providerThinkingBlocks.filter((b) => b.type === 'thinking');
+    const redacted = providerThinkingBlocks.filter((b) => b.type === 'redacted_thinking');
+
+    const matched = Math.min(providerThinking.length, parsedThinking.length);
+    for (let i = 0; i < matched; i++) {
+      const sig = (providerThinking[i] as { signature?: string }).signature;
+      if (sig) {
+        parsedThinking[i]!.signature = sig;
+      }
+    }
+
+    const leftover = providerThinking.slice(matched);
+    if (leftover.length > 0 || redacted.length > 0) {
+      content.unshift(...leftover, ...redacted);
+    }
   }
 
   // ==========================================================================
@@ -1518,9 +1550,12 @@ export class Membrane {
         } else if (block.type === 'thinking') {
           content.push({
             type: 'thinking',
-            thinking: block.thinking,
-            signature: block.signature,
+            thinking: block.thinking ?? '',
+            ...(block.signature ? { signature: block.signature } : {}),
           });
+        } else if (block.type === 'redacted_thinking') {
+          // Pass through verbatim — carries the encrypted `data` payload
+          content.push({ ...(block as any) } as ContentBlock);
         } else if (block.type === 'generated_image') {
           content.push({
             type: 'generated_image',
@@ -1882,6 +1917,11 @@ export class Membrane {
     let rawRequest: unknown;
     let rawResponse: unknown;
 
+    // Native thinking blocks from the provider (with signatures) — merged
+    // into the parser-derived content before the final response is emitted.
+    // See streamWithXmlTools for the matching non-yielding logic.
+    const providerThinkingBlocks: ContentBlock[] = [];
+
     // Track executed tool calls and results
     const executedToolCalls: ToolCall[] = [];
     const executedToolResults: ToolResult[] = [];
@@ -1989,6 +2029,10 @@ export class Membrane {
             timeoutMs: options.timeoutMs,
             idleTimeoutMs: options.idleTimeoutMs,
             normalizedRequest: request,
+            // The tag-based parser tracks thinking via <thinking> tags — ask
+            // the provider to wrap native thinking deltas so they don't
+            // stream as visible text (same as streamWithXmlTools).
+            wrapThinkingTags: true,
             onRequest: (req: unknown) => { rawRequest = req; },
           }
         );
@@ -2000,6 +2044,11 @@ export class Membrane {
           streamResult.stopReason = 'stop_sequence';
           streamResult.stopSequence = detectedStopSequence;
         }
+
+        // Capture native thinking blocks (with signatures) from the provider
+        // response — the text parser can't see signatures, so they're merged
+        // into the final response content after parsing.
+        this.captureProviderThinkingBlocks(streamResult.content, providerThinkingBlocks);
 
         rawResponse = streamResult.raw;
         lastStopReason = this.mapStopReason(streamResult.stopReason);
@@ -2284,6 +2333,9 @@ export class Membrane {
         lastStopSequence
       );
 
+      // Merge provider thinking signatures into parser-derived thinking blocks
+      this.mergeProviderThinkingBlocks(response.content, providerThinkingBlocks);
+
       stream.emit({ type: 'complete', response });
     } catch (error) {
       if (this.isAbortError(error)) {
@@ -2490,6 +2542,10 @@ export class Membrane {
             depth: toolDepth,
             previousResults: executedToolResults,
             accumulated: allTextAccumulated,
+            // Full normalized blocks for this round, in provider order —
+            // lets consumers persist the assistant turn verbatim (signed
+            // thinking must precede tool_use in the same turn).
+            roundContent: responseBlocks,
           };
 
           // Yield control for tool execution

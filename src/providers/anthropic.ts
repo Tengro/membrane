@@ -549,9 +549,18 @@ export function toAnthropicContent(blocks: ContentBlock[]): Anthropic.ContentBlo
           ...(block.signature ? { signature: block.signature } : {}),
         } as any);
         break;
+
+      case 'redacted_thinking':
+        // Round-trip verbatim — `data` is the encrypted reasoning payload;
+        // the API rejects/ignores the block without it.
+        result.push({
+          type: 'redacted_thinking',
+          data: (block as any).data,
+        } as any);
+        break;
     }
   }
-  
+
   return result;
 }
 
@@ -587,7 +596,9 @@ export function fromAnthropicContent(blocks: Anthropic.ContentBlock[]): ContentB
       default:
         // Handle redacted_thinking or unknown types
         if ((block as any).type === 'redacted_thinking') {
-          result.push({ type: 'redacted_thinking' });
+          // Preserve the encrypted `data` payload — without it the block
+          // cannot be round-tripped and prior reasoning is lost.
+          result.push({ type: 'redacted_thinking', data: (block as any).data } as any);
         }
         break;
     }

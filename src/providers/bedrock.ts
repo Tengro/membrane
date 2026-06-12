@@ -681,7 +681,11 @@ export class BedrockAdapter implements ProviderAdapter {
       role: 'assistant',
       content: contentBlocks.map(b => {
         if (b.type === 'thinking') {
-          return { type: 'thinking' as const, thinking: b.thinking, signature: b.signature };
+          return { type: 'thinking' as const, thinking: b.thinking ?? '', signature: b.signature };
+        }
+        if (b.type === 'redacted_thinking') {
+          // Pass through verbatim — carries the encrypted `data` payload
+          return { ...b } as unknown as { type: 'text'; text?: string };
         }
         return { type: b.type as 'text', text: b.text };
       }),
@@ -709,12 +713,17 @@ export class BedrockAdapter implements ProviderAdapter {
           name: block.name,
           input: block.input as Record<string, unknown>,
         });
-      } else if (block.type === 'thinking' && block.thinking) {
+      } else if (block.type === 'thinking') {
+        // Signature-only thinking blocks (display:'omitted') have an empty
+        // thinking field but must still be preserved for round-tripping.
         content.push({
           type: 'thinking',
-          thinking: block.thinking,
-          signature: block.signature,
+          thinking: block.thinking ?? '',
+          ...(block.signature ? { signature: block.signature } : {}),
         });
+      } else if ((block as any).type === 'redacted_thinking') {
+        // Pass through verbatim — carries the encrypted `data` payload
+        content.push({ ...(block as any) } as ContentBlock);
       }
     }
 

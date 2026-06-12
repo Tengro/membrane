@@ -59,18 +59,28 @@ export type ToolResultContentBlock =
 export interface ToolContext {
   /** The raw text that contained the tool calls */
   rawText: string;
-  
+
   /** Text before the tool calls (already streamed to user) */
   preamble: string;
-  
+
   /** Current depth in tool execution loop */
   depth: number;
-  
+
   /** Previous tool results in this execution chain */
   previousResults: ToolResult[];
-  
+
   /** Accumulated output so far */
   accumulated: string;
+
+  /**
+   * Normalized content blocks of the current assistant round, in provider
+   * order (thinking / redacted_thinking / text / tool_use). Present on the
+   * native-tools yielding path. Consumers persisting the assistant turn
+   * should use these verbatim instead of rebuilding from `preamble` +
+   * `calls` — signed thinking blocks must precede their tool_use in the
+   * same turn or the next request fails API validation.
+   */
+  roundContent?: import('./content.js').ContentBlock[];
 }
 
 // ============================================================================
