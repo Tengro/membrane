@@ -990,6 +990,14 @@ export class Membrane {
     const promptCaching = request.promptCaching ?? true;
     const cacheControl = promptCaching ? { type: 'ephemeral' as const, ...(request.cacheTtl ? { ttl: request.cacheTtl } : {}) } : undefined;
 
+    // Anthropic allows at most 4 cache_control breakpoints per request. The
+    // message breakpoints are the valuable ones (they cache the longest prefixes,
+    // and every one already includes tools+system at the front of the request).
+    // So tools/system get a breakpoint only as a FALLBACK — when no message
+    // breakpoint was marked — otherwise they're redundant and would push the
+    // total past 4, which the API hard-rejects (the agent goes unresponsive).
+    let messageBreakpoints = 0;
+
     for (const msg of messages) {
       const isAssistant = msg.participant === assistantName;
       const role = isAssistant ? 'assistant' : 'user';
@@ -1057,6 +1065,7 @@ export class Membrane {
       // Apply cache_control to last block of messages with cacheBreakpoint
       if (msg.cacheBreakpoint && cacheControl && content.length > 0) {
         content[content.length - 1].cache_control = cacheControl;
+        messageBreakpoints++;
       }
 
       providerMessages.push({ role, content });
@@ -1093,18 +1102,21 @@ export class Membrane {
         description: tool.description,
         input_schema: tool.inputSchema,
       };
-      // Cache the tool list — mark the last tool with cache_control
-      if (cacheControl && request.tools && idx === request.tools.length - 1) {
+      // Cache the tool list (last tool) only as a fallback — a marked message
+      // breakpoint already caches the tools as part of its prefix.
+      if (cacheControl && messageBreakpoints === 0 && request.tools && idx === request.tools.length - 1) {
         t.cache_control = cacheControl;
       }
       return t;
     });
 
-    // Wrap system prompt with cache_control if prompt caching is enabled
+    // Wrap system prompt with cache_control only as a fallback (no message
+    // breakpoint marked); otherwise a message breakpoint already caches
+    // tools+system as part of its prefix.
     let system: unknown = request.system;
-    if (cacheControl && typeof system === 'string' && system.length > 0) {
+    if (cacheControl && messageBreakpoints === 0 && typeof system === 'string' && system.length > 0) {
       system = [{ type: 'text', text: system, cache_control: cacheControl }];
-    } else if (cacheControl && Array.isArray(system) && system.length > 0) {
+    } else if (cacheControl && messageBreakpoints === 0 && Array.isArray(system) && system.length > 0) {
       const blocks = system as Record<string, unknown>[];
       system = blocks.map((block, idx) =>
         idx === blocks.length - 1 ? { ...block, cache_control: cacheControl } : block
