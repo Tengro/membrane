@@ -434,7 +434,59 @@ export class NativeFormatter implements PrefillFormatter {
     return tools.map(tool => ({
       name: tool.name,
       description: tool.description,
-      input_schema: tool.inputSchema,
+      input_schema: flattenRootSchemaUnion(tool.inputSchema),
     }));
   }
+}
+
+/**
+ * Anthropic rejects any tool whose `input_schema` ROOT is a `oneOf`/`anyOf`/
+ * `allOf` — the API requires `"type": "object"` at the root and 400s the
+ * entire request before the model runs. Some MCP servers ship such schemas:
+ * e.g. @zereight/mcp-gitlab's `get_ci_catalog_resource` expresses its
+ * "provide either `id` or `full_path`" contract as a root `anyOf`, which
+ * wedged the miner (one bad tool among ~195 fails the whole call).
+ *
+ * Flatten the root union to a plain object: keep the root's existing
+ * `type`/`properties` when present (the common case — the union is then
+ * redundant), otherwise merge the variants' `properties`. The either/or
+ * constraint survives in the property descriptions, so the model still
+ * understands it. Nested unions inside properties are left untouched —
+ * only the schema root is forbidden.
+ */
+function flattenRootSchemaUnion(schema: unknown): unknown {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return schema;
+  const s = schema as Record<string, unknown>;
+  const unionKey = (['anyOf', 'oneOf', 'allOf'] as const).find(k => Array.isArray(s[k]));
+  if (!unionKey) return schema;
+
+  const variants = (s[unionKey] as unknown[]).filter(
+    (v): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v),
+  );
+
+  const { [unionKey]: _dropped, ...rest } = s;
+  const merged: Record<string, unknown> = { ...rest, type: 'object' };
+
+  // Union the variants' properties on top of any the root already declares.
+  const props: Record<string, unknown> = {
+    ...(merged.properties && typeof merged.properties === 'object'
+      ? (merged.properties as Record<string, unknown>)
+      : {}),
+  };
+  for (const v of variants) {
+    if (v.properties && typeof v.properties === 'object') {
+      Object.assign(props, v.properties as Record<string, unknown>);
+    }
+  }
+  if (Object.keys(props).length > 0) merged.properties = props;
+
+  // `required` conflicts across mutually-exclusive variants — keep only keys
+  // every variant requires (safe), otherwise drop it rather than over-constrain.
+  if (!('required' in merged) && variants.length > 0) {
+    const reqLists = variants.map(v => (Array.isArray(v.required) ? (v.required as string[]) : []));
+    const common = reqLists.reduce((acc, r) => acc.filter(x => r.includes(x)), reqLists[0] ?? []);
+    if (common.length > 0) merged.required = common;
+  }
+
+  return merged;
 }
