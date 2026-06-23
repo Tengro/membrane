@@ -15,6 +15,7 @@ import {
   MembraneError,
   rateLimitError,
   contextLengthError,
+  invalidRequestError,
   authError,
   serverError,
   abortError,
@@ -121,12 +122,20 @@ export class AnthropicAdapter implements ProviderAdapter {
       let cacheReadTokens: number | undefined;
       let stopReason: string = 'end_turn';
       let stopSequence: string | undefined;
+      let stopDetails: unknown;
 
       // Content block tracking — finalized on content_block_stop
       const contentBlocks: Record<string, unknown>[] = [];
       let currentBlockIndex = -1;
       let currentBlockContent = '';
       let currentBlockInputJson = '';
+      // When wrapThinkingTags is set (XML formatter path), native thinking
+      // deltas are wrapped in <thinking>...</thinking> on the chunk stream so
+      // the tag-based parser tracks them as thinking instead of visible text.
+      // Tag opened lazily on the first delta — display:'omitted' models emit
+      // thinking blocks with no thinking_delta at all (signature only).
+      const wrapThinkingTags = options?.wrapThinkingTags === true;
+      let thinkingTagOpen = false;
 
       for await (const event of stream) {
         resetIdleTimer();
@@ -151,7 +160,21 @@ export class AnthropicAdapter implements ProviderAdapter {
             callbacks.onChunk(chunk);
           } else if (event.delta.type === 'thinking_delta') {
             currentBlockContent += event.delta.thinking;
+            if (wrapThinkingTags && !thinkingTagOpen) {
+              callbacks.onChunk('<thinking>');
+              thinkingTagOpen = true;
+            }
             callbacks.onChunk(event.delta.thinking);
+          } else if ((event.delta as { type: string }).type === 'signature_delta') {
+            // Accumulate the cryptographic signature that authenticates this
+            // thinking block. Without this, signatures never land on the
+            // streaming path and the next request — which carries the block
+            // back in history — fails Anthropic's signature validation.
+            const sig = (event.delta as { signature?: string }).signature;
+            const block = contentBlocks[currentBlockIndex];
+            if (block && block.type === 'thinking' && sig) {
+              block.signature = ((block.signature as string | undefined) ?? '') + sig;
+            }
           } else if ((event.delta as { type: string }).type === 'input_json_delta') {
             currentBlockInputJson += (event.delta as { partial_json: string }).partial_json;
           }
@@ -165,6 +188,10 @@ export class AnthropicAdapter implements ProviderAdapter {
               block.text = currentBlockContent;
             } else if (block.type === 'thinking') {
               block.thinking = currentBlockContent;
+              if (thinkingTagOpen) {
+                callbacks.onChunk('</thinking>\n');
+                thinkingTagOpen = false;
+              }
             } else if (block.type === 'tool_use' && currentBlockInputJson) {
               try { block.input = JSON.parse(currentBlockInputJson); } catch { /* partial JSON */ }
             }
@@ -175,9 +202,15 @@ export class AnthropicAdapter implements ProviderAdapter {
           // All content blocks are finalized by the time message_delta arrives.
           // Capture final metadata and exit — message_stop and the SSE connection
           // teardown after it add only variable latency with no useful data.
-          const delta = event.delta as { stop_reason?: string; stop_sequence?: string };
+          const delta = event.delta as {
+            stop_reason?: string;
+            stop_sequence?: string;
+            stop_details?: unknown;
+          };
           stopReason = delta.stop_reason ?? 'end_turn';
           stopSequence = delta.stop_sequence ?? undefined;
+          // stop_details carries refusal metadata (e.g., category: 'reasoning_extraction')
+          stopDetails = delta.stop_details ?? undefined;
           const deltaUsage = event.usage as unknown as {
             output_tokens: number;
             cache_creation_input_tokens?: number | null;
@@ -218,6 +251,7 @@ export class AnthropicAdapter implements ProviderAdapter {
           content: contentBlocks,
           stop_reason: stopReason,
           stop_sequence: stopSequence ?? null,
+          stop_details: stopDetails ?? null,
           model,
           usage: {
             input_tokens: inputTokens,
@@ -248,7 +282,11 @@ export class AnthropicAdapter implements ProviderAdapter {
 
   private buildRequest(request: ProviderRequest): Anthropic.MessageCreateParams {
     // Strip provider-specific fields (e.g., sourceUrl for Gemini) from image blocks
-    // before sending to Anthropic, which rejects extra inputs
+    // before sending to Anthropic, which rejects extra inputs.
+    // Also normalize nested tool_result content blocks: Membrane uses camelCase
+    // `mediaType`, Anthropic expects snake_case `media_type`. Without this,
+    // an image returned by a tool reaches the API as `{source: {mediaType: ...}}`
+    // and is silently rejected (the model sees the text label only).
     const sanitizedMessages = (request.messages as any[]).map((msg: any) => {
       if (!Array.isArray(msg.content)) return msg;
       return {
@@ -257,6 +295,12 @@ export class AnthropicAdapter implements ProviderAdapter {
           if (block.type === 'image' && block.sourceUrl !== undefined) {
             const { sourceUrl, ...rest } = block;
             return rest;
+          }
+          if (block.type === 'tool_result' && Array.isArray(block.content)) {
+            return {
+              ...block,
+              content: toAnthropicToolResultContent(block.content as ContentBlock[]),
+            };
           }
           return block;
         }),
@@ -334,7 +378,23 @@ export class AnthropicAdapter implements ProviderAdapter {
 
   private handleError(error: unknown, rawRequest?: unknown): MembraneError {
     if (error instanceof Anthropic.APIError) {
-      const status = error.status;
+      // Mid-stream SSE `error` events are rethrown by the SDK as APIError
+      // with status === undefined (sdk core/streaming.js), so the HTTP
+      // status branches below would never match them — overloaded_error
+      // (529) most commonly arrives exactly this way and used to fall
+      // through to `unknown, retryable: false`. Recover the effective
+      // status from the error body's type instead.
+      const bodyType = (error.error as { error?: { type?: string } } | undefined)?.error?.type;
+      const status = error.status ?? (bodyType !== undefined ? {
+        invalid_request_error: 400,
+        authentication_error: 401,
+        permission_error: 403,
+        not_found_error: 404,
+        request_too_large: 413,
+        rate_limit_error: 429,
+        api_error: 500,
+        overloaded_error: 529,
+      }[bodyType] : undefined);
       const message = error.message;
 
       if (status === 429) {
@@ -351,8 +411,38 @@ export class AnthropicAdapter implements ProviderAdapter {
         return contextLengthError(message, error, rawRequest);
       }
 
-      if (status >= 500) {
+      // 400 invalid_request_error — malformed payload (e.g. orphan tool_use_id,
+      // unknown model, schema violation). Retrying with the same payload is
+      // guaranteed to produce the same 400, so classify these as non-retryable
+      // here. Previously these fell through to the generic `unknown` branch
+      // below, which left them with `retryable: false` but also with no
+      // structured type — making framework-level error policies unable to
+      // distinguish them from genuinely unknown errors.
+      if (status === 400) {
+        return invalidRequestError(message, error, rawRequest);
+      }
+
+      if (status !== undefined && status >= 500) {
         return serverError(message, status, error, rawRequest);
+      }
+
+      // Safety net: if the SSE error body wasn't parseable JSON, neither
+      // status nor bodyType resolves — match the message itself rather
+      // than let a transient capacity error become non-retryable.
+      if (message.toLowerCase().includes('overloaded')) {
+        return serverError(message, 529, error, rawRequest);
+      }
+
+      // Vercel AI Gateway wraps transient upstream outages (a fallback
+      // provider 503, routing churn on a sunsetting model) in non-5xx
+      // aggregate errors whose body carries gateway routing metadata. The
+      // SAME request frequently succeeds on retry once a live provider is
+      // picked, so classify these as retryable instead of terminal.
+      const gw = message.toLowerCase();
+      if (gw.includes("providermetadata") || gw.includes("fallbacksavailable") ||
+          gw.includes("modelattempts") || gw.includes("temporarily unavailable") ||
+          gw.includes("no_providers_available")) {
+        return serverError(message, status ?? 503, error, rawRequest);
       }
     }
 
@@ -385,9 +475,62 @@ export class AnthropicAdapter implements ProviderAdapter {
 // ============================================================================
 
 /**
+ * Convert Membrane tool-result content blocks to Anthropic's tool_result.content
+ * mixed array (text + image). This is what carries an image returned by a tool
+ * (e.g. an MCP fetch_attachment result) all the way to the model. Other block
+ * types are not valid inside tool_result.content per the Anthropic API and are
+ * dropped.
+ */
+function toAnthropicToolResultContent(
+  blocks: ContentBlock[],
+): Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam> {
+  const out: Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam> = [];
+  for (const block of blocks) {
+    if (block.type === 'text') {
+      out.push({ type: 'text', text: block.text });
+    } else if (block.type === 'image') {
+      if (block.source.type === 'base64') {
+        out.push({
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: detectImageMediaType(block.source.data, block.source.mediaType as string) as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
+            data: block.source.data,
+          },
+        });
+      } else if (block.source.type === 'url') {
+        out.push({
+          type: 'image',
+          source: { type: 'url', url: block.source.url },
+        });
+      }
+    }
+  }
+  return out;
+}
+
+/**
  * Convert normalized content blocks to Anthropic format
  * Preserves cache_control for prompt caching
  */
+
+/** Detect image media type from the base64 payload's magic bytes. Storage/ingest
+ *  can lose or mislabel mediaType (e.g. a PNG tagged image/jpeg), which the
+ *  Anthropic API rejects with a 400. Trust the bytes; fall back to the declared
+ *  type, then jpeg. */
+function detectImageMediaType(data: string | undefined, fallback?: string): string {
+  try {
+    const b = Buffer.from((data || "").slice(0, 24), "base64");
+    if (b[0]===0x89&&b[1]===0x50&&b[2]===0x4e&&b[3]===0x47) return "image/png";
+    if (b[0]===0xff&&b[1]===0xd8&&b[2]===0xff) return "image/jpeg";
+    if (b[0]===0x47&&b[1]===0x49&&b[2]===0x46) return "image/gif";
+    if (b[0]===0x52&&b[1]===0x49&&b[2]===0x46) return "image/webp";
+  } catch {}
+  const f = (fallback || "").toLowerCase();
+  if (f==="image/jpeg"||f==="image/png"||f==="image/gif"||f==="image/webp") return f;
+  return "image/jpeg";
+}
+
 export function toAnthropicContent(blocks: ContentBlock[]): Anthropic.ContentBlockParam[] {
   const result: Anthropic.ContentBlockParam[] = [];
   
@@ -409,9 +552,14 @@ export function toAnthropicContent(blocks: ContentBlock[]): Anthropic.ContentBlo
             type: 'image',
             source: {
               type: 'base64',
-              media_type: block.source.mediaType as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
+              media_type: detectImageMediaType(block.source.data, block.source.mediaType as string) as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
               data: block.source.data,
             },
+          });
+        } else if (block.source.type === 'url') {
+          result.push({
+            type: 'image',
+            source: { type: 'url', url: block.source.url },
           });
         }
         break;
@@ -442,7 +590,7 @@ export function toAnthropicContent(blocks: ContentBlock[]): Anthropic.ContentBlo
           tool_use_id: block.toolUseId,
           content: typeof block.content === 'string'
             ? block.content
-            : JSON.stringify(block.content),
+            : toAnthropicToolResultContent(block.content),
           is_error: block.isError,
         });
         break;
@@ -451,11 +599,21 @@ export function toAnthropicContent(blocks: ContentBlock[]): Anthropic.ContentBlo
         result.push({
           type: 'thinking',
           thinking: block.thinking,
+          ...(block.signature ? { signature: block.signature } : {}),
+        } as any);
+        break;
+
+      case 'redacted_thinking':
+        // Round-trip verbatim — `data` is the encrypted reasoning payload;
+        // the API rejects/ignores the block without it.
+        result.push({
+          type: 'redacted_thinking',
+          data: (block as any).data,
         } as any);
         break;
     }
   }
-  
+
   return result;
 }
 
@@ -491,7 +649,9 @@ export function fromAnthropicContent(blocks: Anthropic.ContentBlock[]): ContentB
       default:
         // Handle redacted_thinking or unknown types
         if ((block as any).type === 'redacted_thinking') {
-          result.push({ type: 'redacted_thinking' });
+          // Preserve the encrypted `data` payload — without it the block
+          // cannot be round-tripped and prior reasoning is lost.
+          result.push({ type: 'redacted_thinking', data: (block as any).data } as any);
         }
         break;
     }

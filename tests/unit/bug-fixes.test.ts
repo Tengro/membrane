@@ -10,6 +10,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { Membrane } from '../../src/membrane.js';
+import { NativeFormatter } from '../../src/formatters/native.js';
 import { MockAdapter } from '../../src/providers/mock.js';
 import type { NormalizedRequest, NormalizedMessage } from '../../src/types/index.js';
 
@@ -48,9 +49,9 @@ describe('Temperature enforcement for thinking', () => {
     const request = makeRequest({
       config: {
         model: 'claude-haiku-4-5-20251001',
-        maxTokens: 1000,
+        maxTokens: 4096,
         temperature: 0.5,
-        thinking: { enabled: true, budgetTokens: 1000 },
+        thinking: { enabled: true, budgetTokens: 2048 },
       },
     });
 
@@ -93,9 +94,9 @@ describe('Temperature enforcement for thinking', () => {
     const request = makeRequest({
       config: {
         model: 'claude-haiku-4-5-20251001',
-        maxTokens: 1000,
+        maxTokens: 4096,
         temperature: 0.3,
-        thinking: { enabled: true, budgetTokens: 1000 },
+        thinking: { enabled: true, budgetTokens: 2048 },
       },
     });
 
@@ -105,6 +106,100 @@ describe('Temperature enforcement for thinking', () => {
     });
 
     expect(capturedRequest.temperature).toBe(1);
+  });
+
+  it('clamps thinking budget_tokens below max_tokens', async () => {
+    let capturedRequest: any;
+    const adapter = new MockAdapter({ defaultResponse: 'Hello' });
+    // Native formatter — no assistant prefill, so the thinking param is kept
+    const membrane = new Membrane(adapter, { formatter: new NativeFormatter() });
+
+    const request = makeRequest({
+      config: {
+        model: 'claude-sonnet-4-5-20250929',
+        maxTokens: 4096,
+        thinking: { enabled: true, budgetTokens: 10000 },  // exceeds max_tokens
+      },
+    });
+
+    await membrane.complete(request, {
+      onRequest: (req) => { capturedRequest = req; },
+    });
+
+    expect(capturedRequest.thinking).toEqual({ type: 'enabled', budget_tokens: 4096 - 1024 });
+  });
+
+  it('drops thinking entirely when no valid budget fits under max_tokens', async () => {
+    let capturedRequest: any;
+    const adapter = new MockAdapter({ defaultResponse: 'Hello' });
+    const membrane = new Membrane(adapter);
+
+    const request = makeRequest({
+      config: {
+        model: 'claude-sonnet-4-5-20250929',
+        maxTokens: 1000,  // can't fit minimum 1024 budget below this
+        temperature: 0.5,
+        thinking: { enabled: true, budgetTokens: 5000 },
+      },
+    });
+
+    await membrane.complete(request, {
+      onRequest: (req) => { capturedRequest = req; },
+    });
+
+    expect(capturedRequest.thinking).toBeUndefined();
+    // No thinking sent — temperature should NOT be forced to 1
+    expect(capturedRequest.temperature).toBe(0.5);
+  });
+
+  it('does not clamp adaptive thinking (no budget)', async () => {
+    let capturedRequest: any;
+    const adapter = new MockAdapter({ defaultResponse: 'Hello' });
+    // Native formatter — no assistant prefill, so the thinking param is kept.
+    // Use a configurable-thinking model (not a fable/mythos always-on model,
+    // which omits the thinking param entirely — see isAlwaysThinkingModel).
+    const membrane = new Membrane(adapter, { formatter: new NativeFormatter() });
+
+    const request = makeRequest({
+      config: {
+        model: 'claude-sonnet-4-5-20250929',
+        maxTokens: 1000,
+        thinking: { enabled: true, type: 'adaptive' as const, display: 'summarized' as const },
+      },
+    });
+
+    await membrane.complete(request, {
+      onRequest: (req) => { capturedRequest = req; },
+    });
+
+    expect(capturedRequest.thinking).toEqual({ type: 'adaptive', display: 'summarized' });
+  });
+
+  it('drops API thinking param for prefill-style builds (XML formatter)', async () => {
+    let capturedRequest: any;
+    const adapter = new MockAdapter({ defaultResponse: 'Hello' });
+    // Default AnthropicXmlFormatter — produces an assistant prefill, which the
+    // API rejects in combination with extended thinking. The thinking config
+    // still drives the literal <thinking> text prefix; only the API param is dropped.
+    const membrane = new Membrane(adapter);
+
+    const request = makeRequest({
+      config: {
+        model: 'claude-sonnet-4-5-20250929',
+        maxTokens: 4096,
+        thinking: { enabled: true, budgetTokens: 2048 },
+      },
+    });
+
+    await membrane.complete(request, {
+      onRequest: (req) => { capturedRequest = req; },
+    });
+
+    expect(capturedRequest.thinking).toBeUndefined();
+    // The prefill should still carry the <thinking> text convention
+    const lastMsg = capturedRequest.messages[capturedRequest.messages.length - 1];
+    expect(lastMsg.role).toBe('assistant');
+    expect(String(lastMsg.content)).toContain('<thinking>');
   });
 });
 
@@ -130,7 +225,7 @@ describe('JSON.parse safety for tool arguments', () => {
       const adapterPath = path.join(process.cwd(), 'src/providers', file);
       const source = fs.readFileSync(adapterPath, 'utf-8');
 
-      expect(source).toContain("import { safeParseJson } from './utils.js'");
+      expect(source).toMatch(/import\s*\{[^}]*\bsafeParseJson\b[^}]*\}\s*from\s*['"]\.\/utils\.js['"]/);
       expect(source).toContain('input: safeParseJson(tc.function.arguments)');
       // Verify raw JSON.parse on tool arguments is gone
       expect(source).not.toContain("JSON.parse(tc.function.arguments || '{}')");

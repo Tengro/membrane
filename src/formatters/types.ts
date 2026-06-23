@@ -81,7 +81,64 @@ export interface BuildOptions {
    * This enables per-message cache boundaries in the conversation.
    */
   hasCacheMarker?: (message: NormalizedMessage, index: number) => boolean;
+
+  /**
+   * IDs of tool_use blocks the caller knows are currently in-flight
+   * (e.g. a yielding stream that has emitted the tool_use but is still
+   * waiting on the result). If a trailing unmatched tool_use's id is in
+   * this set, the normalizer signals `ready: false` instead of injecting
+   * a synthetic `[pending]` result. Default: empty (always synthesize).
+   */
+  pendingToolCallIds?: ReadonlySet<string>;
+
+  /**
+   * Telemetry callback fired once per normalization action. Lets the
+   * framework count/log normalizations without coupling Membrane to a
+   * specific logger. See `NormalizeEvent` for the event shapes.
+   */
+  onNormalize?: (event: NormalizeEvent) => void;
 }
+
+/**
+ * Events emitted by the tool-pair normalizer. Surfaced through
+ * `BuildOptions.onNormalize`. Every normalization action emits one
+ * event; treat non-zero counts as a producer-side bug to investigate.
+ */
+export type NormalizeEvent =
+  | { kind: 'block_re_roled'; blockType: string; from: 'user' | 'assistant'; to: 'user' | 'assistant' }
+  | { kind: 'tool_result_hoisted'; toolUseId: string; fromEnvelope: number; toEnvelope: number }
+  | { kind: 'interloper_deferred'; blockType: string; fromEnvelope: number }
+  | { kind: 'synthetic_pending_result'; toolUseId: string; reason: 'trailing' | 'mid_stream' }
+  | { kind: 'orphan_tool_result_textified'; toolUseId: string }
+  | { kind: 'pending_in_flight'; toolUseId: string }
+  | { kind: 'cache_suppressed_for_synthetic'; envelopeIndex: number }
+  | {
+      /**
+       * Fires when the first envelope after re-roling is assistant and a
+       * synthetic `[continuing]` user envelope had to be prepended to
+       * satisfy Anthropic's `messages[0].role === 'user'` requirement.
+       *
+       * `originalFirstRole` distinguishes the two causes a consumer might
+       * want to alert on separately:
+       *   - `'user'`     → re-roling artifact (a strict-role block lived
+       *                    under a user-role message and was moved to a
+       *                    new assistant envelope). Usually benign.
+       *   - `'assistant'`→ producer shipped an assistant-first messages
+       *                    list. Real producer bug worth investigating.
+       *
+       * (Empty input never reaches this event: `rebuildEnvelopes([])`
+       * returns `[]`, and the phase-7 gate requires a non-empty envelope
+       * list. So `input[0]` is always defined when this fires.)
+       *
+       * `leadingBlockTypes` is the block-type list of the now-second
+       * envelope (i.e. what came right after the synthesized user turn),
+       * useful for classifying re-roling causes (e.g. `['thinking']`
+       * vs. `['text', 'tool_use']`).
+       */
+      kind: 'leading_user_synthesized';
+      originalFirstRole: 'user' | 'assistant';
+      leadingBlockTypes: string[];
+    };
 
 // ============================================================================
 // Build Result
@@ -105,6 +162,15 @@ export interface BuildResult {
 
   /** Number of cache control markers applied (for Anthropic prompt caching) */
   cacheMarkersApplied?: number;
+
+  /**
+   * `false` only when the tool-pair normalizer detected a trailing
+   * unmatched tool_use whose id is in `pendingToolCallIds` — i.e. the
+   * caller (yielding stream) is mid-cycle and the request should not be
+   * shipped yet. Callers that don't pass `pendingToolCallIds` will never
+   * see `false` here.
+   */
+  ready?: boolean;
 }
 
 export interface ProviderMessage {

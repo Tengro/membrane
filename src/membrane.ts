@@ -43,7 +43,7 @@ import {
   type ProviderImageBlock,
 } from './utils/tool-parser.js';
 import { IncrementalXmlParser, type ProcessChunkResult } from './utils/stream-parser.js';
-import type { ChunkMeta, BlockEvent } from './types/streaming.js';
+import type { ChunkMeta, BlockEvent, MembraneBlockType, MembraneBlock } from './types/streaming.js';
 import type {
   YieldingStream,
   YieldingStreamOptions,
@@ -52,6 +52,7 @@ import type {
 } from './types/yielding-stream.js';
 import type { PrefillFormatter, StreamParser } from './formatters/types.js';
 import { AnthropicXmlFormatter } from './formatters/anthropic-xml.js';
+import { normalizeToolPairs, mergeConsecutiveRoles } from './formatters/normalize-tool-pairs.js';
 import { YieldingStreamImpl } from './yielding-stream.js';
 import { calculateCost } from './utils/cost.js';
 import { getDefaultPricing } from './registry/default-pricing.js';
@@ -100,11 +101,12 @@ export class Membrane {
       try {
         const { providerRequest, prefillResult } = this.transformRequest(request, options.formatter);
 
-        // Call beforeRequest hook
-        let finalRequest = providerRequest;
-        if (this.config.hooks?.beforeRequest) {
-          finalRequest = await this.config.hooks.beforeRequest(request, providerRequest) ?? providerRequest;
-        }
+        // Route through the single canonical hook helper so any future
+        // change to hook semantics (logging, retry interaction, error
+        // handling) applies to both complete() and the streaming paths.
+        // Cast back to the local provider-request shape: the hook returns
+        // `unknown` deliberately, and we acknowledge the cast at the boundary.
+        const finalRequest = (await this.applyBeforeRequestHook(request, providerRequest)) as typeof providerRequest;
 
         const providerResponse = await this.adapter.complete(finalRequest, {
           signal: options.signal,
@@ -290,6 +292,12 @@ export class Membrane {
     // These can't be handled by the text-based XML parser, so we capture and append them
     const extraContentBlocks: ContentBlock[] = [];
 
+    // Native thinking blocks from the provider (with signatures). The parser
+    // derives signature-less thinking blocks from <thinking> text (via
+    // wrapThinkingTags); signatures from these are merged into those after
+    // parsing, and signature-only blocks are prepended.
+    const providerThinkingBlocks: ContentBlock[] = [];
+
     // Transform initial request using the formatter
     let { providerRequest, prefillResult } = this.transformRequest(request, formatter);
 
@@ -382,6 +390,11 @@ export class Membrane {
           },
           {
             signal,
+            normalizedRequest: request,
+            // The tag-based parser tracks thinking via <thinking> tags — ask the
+            // provider to wrap native thinking deltas so they don't stream as
+            // visible text (see ProviderRequestOptions.wrapThinkingTags)
+            wrapThinkingTags: true,
             onRequest: (req) => {
               rawRequest = req;
               onRequest?.(req);
@@ -409,6 +422,10 @@ export class Membrane {
               } as ContentBlock);
             }
           }
+          // Native thinking blocks carry the signature (encrypted full
+          // reasoning) — captured so consumers can persist and round-trip
+          // them for reasoning continuity.
+          this.captureProviderThinkingBlocks(streamResult.content, providerThinkingBlocks);
         }
 
         rawResponse = streamResult.raw;
@@ -697,6 +714,9 @@ export class Membrane {
         response.content.push(...extraContentBlocks);
       }
 
+      // Merge provider thinking signatures into parser-derived thinking blocks
+      this.mergeProviderThinkingBlocks(response.content, providerThinkingBlocks);
+
       return response;
     } catch (error) {
       // Check if this is an abort error
@@ -788,6 +808,7 @@ export class Membrane {
           },
           {
             signal,
+            normalizedRequest: request,
             onRequest: (req) => {
               rawRequest = req;
               onRequest?.(req);
@@ -969,15 +990,28 @@ export class Membrane {
     const promptCaching = request.promptCaching ?? true;
     const cacheControl = promptCaching ? { type: 'ephemeral' as const, ...(request.cacheTtl ? { ttl: request.cacheTtl } : {}) } : undefined;
 
+    // Anthropic allows at most 4 cache_control breakpoints per request. The
+    // message breakpoints are the valuable ones (they cache the longest prefixes,
+    // and every one already includes tools+system at the front of the request).
+    // So tools/system get a breakpoint only as a FALLBACK — when no message
+    // breakpoint was marked — otherwise they're redundant and would push the
+    // total past 4, which the API hard-rejects (the agent goes unresponsive).
+    let messageBreakpoints = 0;
+
     for (const msg of messages) {
       const isAssistant = msg.participant === assistantName;
       const role = isAssistant ? 'assistant' : 'user';
 
       // Convert content blocks
       const content: any[] = [];
+      const includeNamePrefix = !isAssistant;
       for (const block of msg.content) {
         if (block.type === 'text') {
-          const textBlock: Record<string, unknown> = { type: 'text', text: block.text };
+          let text = block.text;
+          if (includeNamePrefix && msg.participant) {
+            text = `${msg.participant}: ${text}`;
+          }
+          const textBlock: Record<string, unknown> = { type: 'text', text };
           if ((block as any).cache_control) {
             textBlock.cache_control = (block as any).cache_control;
           }
@@ -996,6 +1030,19 @@ export class Membrane {
             content: block.content,
             is_error: block.isError,
           });
+        } else if (block.type === 'thinking') {
+          // Round-trip thinking blocks verbatim including the signature — the
+          // API validates it and (on display:'omitted' models) decrypts it to
+          // reconstruct prior reasoning. Empty thinking + signature is valid.
+          content.push({
+            type: 'thinking',
+            thinking: (block as { thinking?: string }).thinking ?? '',
+            ...((block as { signature?: string }).signature
+              ? { signature: (block as { signature?: string }).signature }
+              : {}),
+          });
+        } else if (block.type === 'redacted_thinking') {
+          content.push({ ...(block as unknown as Record<string, unknown>) });
         } else if (block.type === 'image') {
           if (block.source.type === 'base64') {
             const imageBlock: Record<string, unknown> = {
@@ -1018,11 +1065,34 @@ export class Membrane {
       // Apply cache_control to last block of messages with cacheBreakpoint
       if (msg.cacheBreakpoint && cacheControl && content.length > 0) {
         content[content.length - 1].cache_control = cacheControl;
+        messageBreakpoints++;
       }
 
       providerMessages.push({ role, content });
     }
-    
+
+    // Wire-boundary safety net: repair upstream-produced violations of
+    // Anthropic's tool-cycle structural rules (orphan tool_use, mis-roled
+    // blocks, consecutive same-role envelopes from upstream chunkers that
+    // dropped a tool_result). Mirrors NativeFormatter.buildMessages — the
+    // streaming-native path (runNativeToolsYielding) used to bypass this
+    // and exposed every agent inference to the 400 family.
+    //
+    // Synthesized [pending] tool_results land in fresh user envelopes;
+    // the normalizer also suppresses cache_control on those envelopes
+    // so an in-flight gap can't poison the prompt cache. Merging after
+    // normalize collapses any same-role neighbours the upstream may have
+    // produced before they reach the API's alternating-role check.
+    //
+    // `pendingToolCallIds` is intentionally not threaded here: by the
+    // time runNativeToolsYielding rebuilds the request between
+    // tool-execution rounds, it has already appended the corresponding
+    // tool_results to `messages`. Any unmatched tool_use that reaches
+    // this splice is upstream stranding (the bug class this fix exists
+    // to catch) — `[pending]` is exactly the right synthesis.
+    const normalized = normalizeToolPairs(providerMessages);
+    const mergedMessages = mergeConsecutiveRoles(normalized.messages);
+
     // Convert tools to provider format.
     // Native tool names must match ^[a-zA-Z0-9_-]{1,128}$ — sanitize colons
     // from the module:tool namespace convention. Reversed in parseProviderContent.
@@ -1032,40 +1102,41 @@ export class Membrane {
         description: tool.description,
         input_schema: tool.inputSchema,
       };
-      // Cache the tool list — mark the last tool with cache_control
-      if (cacheControl && request.tools && idx === request.tools.length - 1) {
+      // Cache the tool list (last tool) only as a fallback — a marked message
+      // breakpoint already caches the tools as part of its prefix.
+      if (cacheControl && messageBreakpoints === 0 && request.tools && idx === request.tools.length - 1) {
         t.cache_control = cacheControl;
       }
       return t;
     });
 
-    // Wrap system prompt with cache_control if prompt caching is enabled
+    // Wrap system prompt with cache_control only as a fallback (no message
+    // breakpoint marked); otherwise a message breakpoint already caches
+    // tools+system as part of its prefix.
     let system: unknown = request.system;
-    if (cacheControl && typeof system === 'string' && system.length > 0) {
+    if (cacheControl && messageBreakpoints === 0 && typeof system === 'string' && system.length > 0) {
       system = [{ type: 'text', text: system, cache_control: cacheControl }];
-    } else if (cacheControl && Array.isArray(system) && system.length > 0) {
+    } else if (cacheControl && messageBreakpoints === 0 && Array.isArray(system) && system.length > 0) {
       const blocks = system as Record<string, unknown>[];
       system = blocks.map((block, idx) =>
         idx === blocks.length - 1 ? { ...block, cache_control: cacheControl } : block
       );
     }
 
-    // Build thinking config for native extended thinking
-    const thinking = request.config.thinking?.enabled
-      ? {
-          type: 'enabled' as const,
-          budget_tokens: request.config.thinking.budgetTokens ?? 5000,
-        }
-      : undefined;
+    // Build thinking config for native extended thinking (budget clamped to max_tokens)
+    // Fable/Mythos models: thinking is always on and unconfigurable; sampling params are removed.
+    // Sending thinking config or temperature returns a 400 — omit both entirely.
+    const alwaysOnThinking = Membrane.isAlwaysThinkingModel(request.config.model);
+    const thinking = alwaysOnThinking ? undefined : this.buildThinkingParam(request.config);
 
     // Anthropic requires temperature=1 when extended thinking is enabled
-    const temperature = thinking ? 1 : request.config.temperature;
+    const temperature = alwaysOnThinking ? undefined : (thinking ? 1 : request.config.temperature);
 
     return {
       model: request.config.model,
       maxTokens: request.config.maxTokens,
       temperature,
-      messages: providerMessages,
+      messages: mergedMessages,
       system,
       tools,
       thinking,
@@ -1094,9 +1165,12 @@ export class Membrane {
         } else if (item.type === 'thinking') {
           blocks.push({
             type: 'thinking',
-            thinking: item.thinking,
-            signature: item.signature,
+            thinking: item.thinking ?? '',
+            ...(item.signature ? { signature: item.signature } : {}),
           });
+        } else if (item.type === 'redacted_thinking') {
+          // Pass through verbatim — carries the encrypted `data` payload
+          blocks.push({ ...item } as ContentBlock);
         } else if (item.type === 'generated_image') {
           blocks.push({
             type: 'generated_image',
@@ -1107,12 +1181,73 @@ export class Membrane {
       }
       return blocks;
     }
-    
+
     if (typeof content === 'string') {
       return [{ type: 'text', text: content }];
     }
-    
+
     return [];
+  }
+
+  /**
+   * Capture native thinking / redacted_thinking blocks from a provider
+   * response so they can be merged into parser-derived content (XML paths,
+   * where the parser only sees text). Includes signature-only thinking
+   * blocks (display:'omitted' returns an empty thinking field).
+   */
+  private captureProviderThinkingBlocks(
+    providerContent: unknown,
+    sink: ContentBlock[]
+  ): void {
+    if (!Array.isArray(providerContent)) return;
+    for (const block of providerContent) {
+      if (block?.type === 'thinking') {
+        sink.push({
+          type: 'thinking',
+          thinking: (block as any).thinking ?? '',
+          ...((block as any).signature ? { signature: (block as any).signature } : {}),
+        } as ContentBlock);
+      } else if (block?.type === 'redacted_thinking') {
+        sink.push({ ...(block as any) } as ContentBlock);
+      }
+    }
+  }
+
+  /**
+   * Merge provider thinking signatures into parser-derived thinking blocks
+   * (matched in stream order), and prepend any leftover provider blocks —
+   * signature-only thinking (display:'omitted') never appears in the text
+   * stream, so the parser produces no block for it. redacted_thinking
+   * blocks are always prepended verbatim.
+   *
+   * Mutates `content` in place. Shared by the XML stream paths
+   * (streamWithXmlTools and runXmlToolsYielding).
+   */
+  private mergeProviderThinkingBlocks(
+    content: ContentBlock[],
+    providerThinkingBlocks: ContentBlock[]
+  ): void {
+    if (providerThinkingBlocks.length === 0) return;
+
+    const parsedThinking = content.filter(
+      (b) => b.type === 'thinking'
+    ) as Array<{ type: 'thinking'; thinking: string; signature?: string }>;
+
+    const providerThinking = providerThinkingBlocks.filter((b) => b.type === 'thinking');
+    const redacted = providerThinkingBlocks.filter((b) => b.type === 'redacted_thinking');
+
+    const matched = Math.min(providerThinking.length, parsedThinking.length);
+    for (let i = 0; i < matched; i++) {
+      const sig = (providerThinking[i] as { signature?: string }).signature;
+      if (sig) {
+        parsedThinking[i]!.signature = sig;
+      }
+    }
+
+    const leftover = providerThinking.slice(matched);
+    if (leftover.length > 0 || redacted.length > 0) {
+      content.unshift(...leftover, ...redacted);
+    }
   }
 
   // ==========================================================================
@@ -1120,21 +1255,83 @@ export class Membrane {
   // ==========================================================================
 
   /**
+   * Apply the configured `beforeRequest` hook to a provider-format request.
+   * Returns the (possibly modified) request, or the original if no hook is
+   * configured. This is the single point that all request-build sites should
+   * route through before invoking the adapter, so observers / mutators
+   * (logging, redaction, model rewriting) see every API call regardless of
+   * whether it came from `complete()`, `stream()`, or `streamYielding()`.
+   */
+  private async applyBeforeRequestHook(
+    normalizedRequest: NormalizedRequest,
+    providerRequest: unknown,
+  ): Promise<unknown> {
+    if (!this.config.hooks?.beforeRequest) return providerRequest;
+    const result = await this.config.hooks.beforeRequest(normalizedRequest, providerRequest);
+    return result ?? providerRequest;
+  }
+
+  /**
    * Extract base provider params from config, with thinking temperature enforcement.
    * Used by transformRequest, buildContinuationRequest, and buildContinuationRequestWithImages.
    */
   private getBaseProviderParams(config: NormalizedRequest['config']) {
+    // Fable/Mythos models: thinking always on (unconfigurable), sampling params removed — omit both.
+    const alwaysOnThinking = Membrane.isAlwaysThinkingModel(config.model);
+    // Build thinking config for native extended thinking
+    const thinking = alwaysOnThinking ? undefined : this.buildThinkingParam(config);
     // Anthropic requires temperature=1 when extended thinking is enabled
-    const temperature = config.thinking?.enabled ? 1 : config.temperature;
+    const temperature = alwaysOnThinking ? undefined : (thinking ? 1 : config.temperature);
     return {
       model: config.model,
       maxTokens: config.maxTokens,
       temperature,
-      topP: config.topP,
-      topK: config.topK,
+      topP: alwaysOnThinking ? undefined : config.topP,
+      topK: alwaysOnThinking ? undefined : config.topK,
       presencePenalty: config.presencePenalty,
       frequencyPenalty: config.frequencyPenalty,
+      repetitionPenalty: config.repetitionPenalty,
+      thinking,
     };
+  }
+
+  /**
+   * Models with always-on, unconfigurable thinking (Claude Fable/Mythos family).
+   * These reject `thinking` config and sampling params (`temperature`, `top_p`, `top_k`)
+   * with a 400 — callers must omit them entirely.
+   */
+  private static isAlwaysThinkingModel(model: string | undefined): boolean {
+    return /\b(fable|mythos)\b/i.test(model ?? '');
+  }
+
+  /**
+   * Build the provider thinking parameter from config.
+   *
+   * For type 'enabled', the API requires max_tokens > budget_tokens and a
+   * minimum budget of 1024 — a misconfigured budget (e.g., default 10000 with
+   * max_tokens 4096) is clamped to fit. If no valid budget fits (max_tokens
+   * too small), thinking is omitted entirely rather than sending a request
+   * the API will reject.
+   */
+  private buildThinkingParam(config: NormalizedRequest['config']):
+    | { type: 'adaptive'; display?: 'summarized' | 'omitted' }
+    | { type: 'enabled'; budget_tokens: number; display?: 'summarized' | 'omitted' }
+    | undefined {
+    if (!config.thinking?.enabled) return undefined;
+
+    const display = config.thinking.display;
+    if ((config.thinking.type ?? 'enabled') === 'adaptive') {
+      return { type: 'adaptive', ...(display ? { display } : {}) };
+    }
+
+    const requested = config.thinking.budgetTokens ?? 5000;
+    const maxTokens = typeof config.maxTokens === 'number' ? config.maxTokens : undefined;
+    const budget = maxTokens !== undefined ? Math.min(requested, maxTokens - 1024) : requested;
+    if (budget < 1024) {
+      // Can't fit a valid thinking budget under max_tokens — skip thinking
+      return undefined;
+    }
+    return { type: 'enabled', budget_tokens: budget, ...(display ? { display } : {}) };
   }
 
   /**
@@ -1184,15 +1381,47 @@ export class Membrane {
       },
     };
 
+    // The API rejects extended thinking combined with an assistant prefill.
+    // Prefill-style builds (XML formatter) use the thinking config for the
+    // literal `<thinking>` text prefix instead of the API feature — drop the
+    // API param when the built request actually ends in an assistant prefill.
+    // Chat-style builds (no prefill) keep it.
+    if (buildResult.assistantPrefill && providerRequest.thinking) {
+      delete providerRequest.thinking;
+    }
+
     return { providerRequest, prefillResult: buildResult };
   }
 
   private async streamOnce(
     request: any,
     callbacks: { onChunk: (chunk: string) => void; onContentBlock?: (index: number, block: unknown) => void },
-    options: { signal?: AbortSignal; timeoutMs?: number; idleTimeoutMs?: number; onRequest?: (rawRequest: unknown) => void }
+    options: {
+      signal?: AbortSignal;
+      timeoutMs?: number;
+      idleTimeoutMs?: number;
+      onRequest?: (rawRequest: unknown) => void;
+      /** See ProviderRequestOptions.wrapThinkingTags */
+      wrapThinkingTags?: boolean;
+      /**
+       * The original NormalizedRequest, threaded through so the
+       * `beforeRequest` hook can see both shapes (normalized + provider).
+       * Required: forgetting this is the failure mode the helper exists to
+       * prevent (the streaming paths previously skipped the hook entirely).
+       * If a future caller genuinely needs to bypass the hook, introduce a
+       * separate `streamOnceWithoutHook` so the bypass is intentional.
+       */
+      normalizedRequest: NormalizedRequest;
+    }
   ) {
-    return await this.adapter.stream(request, callbacks, options);
+    // Strip `normalizedRequest` before forwarding to the adapter — it's
+    // not part of `ProviderRequestOptions` and TypeScript's structural
+    // compatibility won't catch the excess field (checked only on object
+    // literals, not on variables). Leaving it in would silently leak the
+    // normalized form into every adapter's options.
+    const { normalizedRequest, ...adapterOptions } = options;
+    const finalRequest = (await this.applyBeforeRequestHook(normalizedRequest, request)) as typeof request;
+    return await this.adapter.stream(finalRequest, callbacks, adapterOptions);
   }
 
   private buildContinuationRequest(
@@ -1223,6 +1452,9 @@ export class Membrane {
     
     return {
       ...this.getBaseProviderParams(originalRequest.config),
+      // Continuations always end in an assistant prefill — the API rejects
+      // extended thinking combined with prefill, so never send the param here
+      thinking: undefined,
       messages,
       system: prefillResult.systemContent
         ? (Array.isArray(prefillResult.systemContent) && prefillResult.systemContent.length > 0
@@ -1293,6 +1525,9 @@ export class Membrane {
 
     return {
       ...this.getBaseProviderParams(originalRequest.config),
+      // Continuations always end in an assistant prefill — the API rejects
+      // extended thinking combined with prefill, so never send the param here
+      thinking: undefined,
       messages,
       system: prefillResult.systemContent
         ? (Array.isArray(prefillResult.systemContent) && prefillResult.systemContent.length > 0
@@ -1341,9 +1576,12 @@ export class Membrane {
         } else if (block.type === 'thinking') {
           content.push({
             type: 'thinking',
-            thinking: block.thinking,
-            signature: block.signature,
+            thinking: block.thinking ?? '',
+            ...(block.signature ? { signature: block.signature } : {}),
           });
+        } else if (block.type === 'redacted_thinking') {
+          // Pass through verbatim — carries the encrypted `data` payload
+          content.push({ ...(block as any) } as ContentBlock);
         } else if (block.type === 'generated_image') {
           content.push({
             type: 'generated_image',
@@ -1526,6 +1764,11 @@ export class Membrane {
         return 'stop_sequence';
       case 'tool_use':
         return 'tool_use';
+      case 'refusal':
+        // Safety refusal (e.g., Fable 5 reasoning_extraction). Must survive
+        // mapping — downstream consumers react to refusals (chapterx adds a
+        // Discord reaction). Defaulting this to end_turn silently hid them.
+        return 'refusal';
       default:
         return 'end_turn';
     }
@@ -1673,11 +1916,20 @@ export class Membrane {
   ): Promise<void> {
     const startTime = Date.now();
     const {
-      maxToolDepth = 10,
+      maxToolDepth: maxToolDepthOpt,
       emitTokens = true,
       emitBlocks = true,
       emitUsage = true,
     } = options;
+    // Yielding paths default to unlimited (the caller — typically an agent
+    // framework — drives the stream and is expected to budget its own work).
+    // Omit `maxToolDepth` for unlimited; `-1` is an explicit "unlimited"
+    // sentinel for callers that need to write the value out; any other
+    // number is taken at face value as the cap.
+    const maxToolDepth =
+      maxToolDepthOpt === undefined || maxToolDepthOpt === -1
+        ? Infinity
+        : maxToolDepthOpt;
 
     // Initialize parser from formatter for format-specific tracking
     const formatter = this.formatter;
@@ -1690,6 +1942,11 @@ export class Membrane {
     let lastStopSequence: string | undefined;
     let rawRequest: unknown;
     let rawResponse: unknown;
+
+    // Native thinking blocks from the provider (with signatures) — merged
+    // into the parser-derived content before the final response is emitted.
+    // See streamWithXmlTools for the matching non-yielding logic.
+    const providerThinkingBlocks: ContentBlock[] = [];
 
     // Track executed tool calls and results
     const executedToolCalls: ToolCall[] = [];
@@ -1797,6 +2054,11 @@ export class Membrane {
             signal: stream.signal,
             timeoutMs: options.timeoutMs,
             idleTimeoutMs: options.idleTimeoutMs,
+            normalizedRequest: request,
+            // The tag-based parser tracks thinking via <thinking> tags — ask
+            // the provider to wrap native thinking deltas so they don't
+            // stream as visible text (same as streamWithXmlTools).
+            wrapThinkingTags: true,
             onRequest: (req: unknown) => { rawRequest = req; },
           }
         );
@@ -1808,6 +2070,11 @@ export class Membrane {
           streamResult.stopReason = 'stop_sequence';
           streamResult.stopSequence = detectedStopSequence;
         }
+
+        // Capture native thinking blocks (with signatures) from the provider
+        // response — the text parser can't see signatures, so they're merged
+        // into the final response content after parsing.
+        this.captureProviderThinkingBlocks(streamResult.content, providerThinkingBlocks);
 
         rawResponse = streamResult.raw;
         lastStopReason = this.mapStopReason(streamResult.stopReason);
@@ -2092,6 +2359,9 @@ export class Membrane {
         lastStopSequence
       );
 
+      // Merge provider thinking signatures into parser-derived thinking blocks
+      this.mergeProviderThinkingBlocks(response.content, providerThinkingBlocks);
+
       stream.emit({ type: 'complete', response });
     } catch (error) {
       if (this.isAbortError(error)) {
@@ -2121,10 +2391,20 @@ export class Membrane {
   ): Promise<void> {
     const startTime = Date.now();
     const {
-      maxToolDepth = 10,
+      maxToolDepth: maxToolDepthOpt,
       emitTokens = true,
+      emitBlocks = true,
       emitUsage = true,
     } = options;
+    // Yielding paths default to unlimited (the caller — typically an agent
+    // framework — drives the stream and is expected to budget its own work).
+    // Omit `maxToolDepth` for unlimited; `-1` is an explicit "unlimited"
+    // sentinel for callers that need to write the value out; any other
+    // number is taken at face value as the cap.
+    const maxToolDepth =
+      maxToolDepthOpt === undefined || maxToolDepthOpt === -1
+        ? Infinity
+        : maxToolDepthOpt;
 
     let toolDepth = 0;
     let totalUsage: DetailedUsage = { inputTokens: 0, outputTokens: 0 };
@@ -2162,6 +2442,17 @@ export class Membrane {
         // Stream from provider
         let textAccumulated = '';
         let blockIndex = 0;
+        // Track block-type from the provider's content_block_start signal so
+        // every token chunk is tagged with the membrane block it belongs to.
+        // Without this, thinking_delta chunks get mislabelled as 'text' and
+        // downstream consumers (TUIs, WebUIs) can't render them distinctly.
+        let currentBlockType: MembraneBlockType = 'text';
+        const seenBlockIndices = new Set<number>();
+        const mapApiBlockType = (apiType: string | undefined): MembraneBlockType => {
+          if (apiType === 'thinking') return 'thinking';
+          if (apiType === 'tool_use') return 'tool_call';
+          return 'text';
+        };
         const streamResult = await this.streamOnce(
           providerRequest,
           {
@@ -2173,19 +2464,61 @@ export class Membrane {
 
               if (emitTokens) {
                 const meta: ChunkMeta = {
-                  type: 'text',
-                  visible: true,
+                  type: currentBlockType,
+                  visible: currentBlockType === 'text',
                   blockIndex,
                 };
                 stream.emit({ type: 'tokens', content: chunk, meta });
               }
             },
-            onContentBlock: undefined,
+            onContentBlock: (index, block) => {
+              if (stream.isCancelled) return;
+              const apiType = (block as { type?: string } | undefined)?.type;
+              const mbType = mapApiBlockType(apiType);
+              const isStart = !seenBlockIndices.has(index);
+              if (isStart) {
+                seenBlockIndices.add(index);
+                currentBlockType = mbType;
+                blockIndex = index;
+                if (emitBlocks) {
+                  stream.emit({
+                    type: 'block',
+                    event: { event: 'block_start', index, block: { type: mbType } },
+                  });
+                }
+              } else if (emitBlocks) {
+                // Second call for the same index = content_block_stop. The
+                // provider has filled the block with final content; surface
+                // a block_complete with the relevant fields for consumers
+                // that want full block payloads (e.g. context-manager).
+                const apiBlock = block as {
+                  type?: string;
+                  text?: string;
+                  thinking?: string;
+                  id?: string;
+                  name?: string;
+                  input?: unknown;
+                } | undefined;
+                const mb: MembraneBlock = { type: mbType };
+                if (mbType === 'text') mb.content = apiBlock?.text;
+                else if (mbType === 'thinking') mb.content = apiBlock?.thinking;
+                else if (mbType === 'tool_call') {
+                  mb.toolId = apiBlock?.id;
+                  mb.toolName = apiBlock?.name;
+                  mb.input = apiBlock?.input as Record<string, unknown> | undefined;
+                }
+                stream.emit({
+                  type: 'block',
+                  event: { event: 'block_complete', index, block: mb },
+                });
+              }
+            },
           },
           {
             signal: stream.signal,
             timeoutMs: options.timeoutMs,
             idleTimeoutMs: options.idleTimeoutMs,
+            normalizedRequest: request,
             onRequest: (req: unknown) => { rawRequest = req; },
           }
         );
@@ -2235,6 +2568,10 @@ export class Membrane {
             depth: toolDepth,
             previousResults: executedToolResults,
             accumulated: allTextAccumulated,
+            // Full normalized blocks for this round, in provider order —
+            // lets consumers persist the assistant turn verbatim (signed
+            // thinking must precede tool_use in the same turn).
+            roundContent: responseBlocks,
           };
 
           // Yield control for tool execution
@@ -2341,13 +2678,16 @@ export class Membrane {
 }
 
 // Native tool names must match ^[a-zA-Z0-9_-]{1,128}$.
-// The framework uses module:tool namespacing, so we round-trip colons
-// through an escape encoding for the API wire format.
-// Lossless: escape underscores first (_u), then encode colons (_c).
+// Tool names use `--` namespacing, which is already API-valid; the only
+// character that ever needs escaping is a literal colon, encoded losslessly as
+// `__` and back. We deliberately do NOT escape underscores — they are valid,
+// and escaping them (the previous `_u`/`_c` scheme) garbled every
+// underscore-containing tool name in the request the model actually sees
+// (`send_message` → `send_umessage`), polluting its reasoning for no benefit.
 function sanitizeToolName(name: string): string {
-  return name.replace(/_/g, '_u').replace(/:/g, '_c');
+  return name.replace(/:/g, '__');
 }
 
 function unsanitizeToolName(name: string): string {
-  return name.replace(/_c/g, ':').replace(/_u/g, '_');
+  return name.replace(/__/g, ':');
 }

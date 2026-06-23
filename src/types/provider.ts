@@ -215,6 +215,9 @@ export interface ProviderRequest {
   /** Frequency penalty */
   frequencyPenalty?: number;
 
+  /** Repetition penalty (multiplicative, vLLM/HuggingFace style) */
+  repetitionPenalty?: number;
+
   /** Stop sequences */
   stopSequences?: string[];
   
@@ -232,6 +235,13 @@ export interface ProviderRequestOptions {
   idleTimeoutMs?: number;
   /** Called with the raw API request body right before fetch */
   onRequest?: (rawRequest: unknown) => void;
+  /**
+   * Wrap native thinking deltas in <thinking>...</thinking> tags on the
+   * onChunk stream. Used by the XML formatter path so its tag-based parser
+   * tracks thinking blocks; without this, native thinking content streams
+   * indistinguishably from visible text.
+   */
+  wrapThinkingTags?: boolean;
 }
 
 export interface ProviderResponse {

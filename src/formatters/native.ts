@@ -28,6 +28,7 @@ import type {
   BlockEvent,
   StreamEmission,
 } from './types.js';
+import { normalizeToolPairs, mergeConsecutiveRoles } from './normalize-tool-pairs.js';
 
 // ============================================================================
 // Configuration
@@ -181,6 +182,15 @@ export class NativeFormatter implements PrefillFormatter {
       ? { type: 'ephemeral', ...(cacheTtl ? { ttl: cacheTtl } : {}) }
       : undefined;
 
+    // The system block is cached only as a FALLBACK. When the context strategy
+    // marks any message breakpoint, that breakpoint already caches a prefix
+    // beginning at the front of the request — tools + system included — so a
+    // separate system breakpoint is redundant. Placing it anyway both wastes one
+    // of Anthropic's 4 cache_control slots and can push a 4-marker turn to 5,
+    // which the API hard-rejects. So we only cache the system block when the
+    // caller/strategy marked no breakpoints of its own.
+    let markedBreakpoints = 0;
+
     const providerMessages: ProviderMessage[] = [];
 
     // Add context prefix as first assistant message (for simulacrum seeding)
@@ -188,6 +198,7 @@ export class NativeFormatter implements PrefillFormatter {
       const prefixBlock: Record<string, unknown> = { type: 'text', text: contextPrefix };
       if (promptCaching && cacheControl) {
         prefixBlock.cache_control = cacheControl;
+        markedBreakpoints++;
       }
       providerMessages.push({
         role: 'assistant',
@@ -234,6 +245,7 @@ export class NativeFormatter implements PrefillFormatter {
         const prevContent = Array.isArray(prevMsg.content) ? prevMsg.content as Record<string, unknown>[] : [];
         if (prevContent.length > 0) {
           prevContent[prevContent.length - 1]!.cache_control = cacheControl;
+          markedBreakpoints++;
         }
       }
 
@@ -242,27 +254,40 @@ export class NativeFormatter implements PrefillFormatter {
       // cacheBreakpoint: cache up to and INCLUDING this message — tag last block
       if (message.cacheBreakpoint && cacheControl && content.length > 0) {
         (content[content.length - 1] as Record<string, unknown>).cache_control = cacheControl;
+        markedBreakpoints++;
       }
     }
 
-    // Merge consecutive same-role messages (API requires alternating)
-    const mergedMessages = this.mergeConsecutiveRoles(providerMessages);
+    // Tool-pair normalizer: wire-boundary safety net for Anthropic's
+    // structural rules on tool cycles. See `normalize-tool-pairs.ts`
+    // for the full rationale. Runs BEFORE mergeConsecutiveRoles so the
+    // merge sees role-correct envelopes.
+    const normalized = normalizeToolPairs(providerMessages, {
+      pendingToolCallIds: options.pendingToolCallIds,
+      onEvent: options.onNormalize,
+    });
 
-    // Build system content with optional cache control
+    // Merge consecutive same-role messages (API requires alternating)
+    const mergedMessages = mergeConsecutiveRoles(normalized.messages);
+
+    // Build system content. Cache the system block only as a fallback — when no
+    // message breakpoint was marked (see note above; otherwise a message
+    // breakpoint already caches tools+system as part of its prefix).
+    const cacheSystem = cacheControl && markedBreakpoints === 0 ? cacheControl : undefined;
     let systemContent: unknown;
     if (typeof systemPrompt === 'string') {
-      if (cacheControl) {
+      if (cacheSystem) {
         // Must use array format for cache_control support
-        systemContent = [{ type: 'text', text: systemPrompt, cache_control: cacheControl }];
+        systemContent = [{ type: 'text', text: systemPrompt, cache_control: cacheSystem }];
       } else {
         systemContent = systemPrompt;
       }
     } else if (Array.isArray(systemPrompt)) {
-      if (cacheControl && systemPrompt.length > 0) {
+      if (cacheSystem && systemPrompt.length > 0) {
         // Add cache_control to the last system block
         systemContent = systemPrompt.map((block, idx) => {
           if (idx === systemPrompt.length - 1) {
-            return { ...block, cache_control: cacheControl };
+            return { ...block, cache_control: cacheSystem };
           }
           return block;
         });
@@ -279,6 +304,7 @@ export class NativeFormatter implements PrefillFormatter {
       systemContent,
       stopSequences: additionalStopSequences ?? [],
       nativeTools,
+      ready: normalized.ready,
     };
   }
 
@@ -374,10 +400,20 @@ export class NativeFormatter implements PrefillFormatter {
           is_error: block.isError,
         });
       } else if (block.type === 'thinking') {
+        // Round-trip thinking blocks verbatim, including the signature — the
+        // API validates it and (on display:'omitted' models) decrypts it to
+        // reconstruct the original reasoning. Signature-only blocks (empty
+        // thinking field) are valid and must be passed back unchanged.
         result.push({
           type: 'thinking',
           thinking: block.thinking,
+          ...((block as { signature?: string }).signature
+            ? { signature: (block as { signature?: string }).signature }
+            : {}),
         });
+      } else if (block.type === 'redacted_thinking') {
+        // Pass through verbatim (carries encrypted data field)
+        result.push({ ...(block as unknown as Record<string, unknown>) });
       } else if (block.type === 'document' || block.type === 'audio') {
         hasUnsupportedMedia = true;
       }
@@ -394,38 +430,63 @@ export class NativeFormatter implements PrefillFormatter {
     return result;
   }
 
-  private mergeConsecutiveRoles(messages: ProviderMessage[]): ProviderMessage[] {
-    if (messages.length === 0) return [];
-
-    const merged: ProviderMessage[] = [];
-    let current: ProviderMessage = messages[0]!;
-
-    for (let i = 1; i < messages.length; i++) {
-      const next: ProviderMessage = messages[i]!;
-
-      if (next.role === current.role) {
-        // Merge content arrays
-        const currentContent = Array.isArray(current.content) ? current.content : [current.content];
-        const nextContent = Array.isArray(next.content) ? next.content : [next.content];
-        current = {
-          role: current.role,
-          content: [...currentContent, ...nextContent],
-        };
-      } else {
-        merged.push(current);
-        current = next;
-      }
-    }
-
-    merged.push(current);
-    return merged;
-  }
-
   private convertToNativeTools(tools: ToolDefinition[]): unknown[] {
     return tools.map(tool => ({
       name: tool.name,
       description: tool.description,
-      input_schema: tool.inputSchema,
+      input_schema: flattenRootSchemaUnion(tool.inputSchema),
     }));
   }
+}
+
+/**
+ * Anthropic rejects any tool whose `input_schema` ROOT is a `oneOf`/`anyOf`/
+ * `allOf` — the API requires `"type": "object"` at the root and 400s the
+ * entire request before the model runs. Some MCP servers ship such schemas:
+ * e.g. @zereight/mcp-gitlab's `get_ci_catalog_resource` expresses its
+ * "provide either `id` or `full_path`" contract as a root `anyOf`, which
+ * wedged the miner (one bad tool among ~195 fails the whole call).
+ *
+ * Flatten the root union to a plain object: keep the root's existing
+ * `type`/`properties` when present (the common case — the union is then
+ * redundant), otherwise merge the variants' `properties`. The either/or
+ * constraint survives in the property descriptions, so the model still
+ * understands it. Nested unions inside properties are left untouched —
+ * only the schema root is forbidden.
+ */
+function flattenRootSchemaUnion(schema: unknown): unknown {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return schema;
+  const s = schema as Record<string, unknown>;
+  const unionKey = (['anyOf', 'oneOf', 'allOf'] as const).find(k => Array.isArray(s[k]));
+  if (!unionKey) return schema;
+
+  const variants = (s[unionKey] as unknown[]).filter(
+    (v): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v),
+  );
+
+  const { [unionKey]: _dropped, ...rest } = s;
+  const merged: Record<string, unknown> = { ...rest, type: 'object' };
+
+  // Union the variants' properties on top of any the root already declares.
+  const props: Record<string, unknown> = {
+    ...(merged.properties && typeof merged.properties === 'object'
+      ? (merged.properties as Record<string, unknown>)
+      : {}),
+  };
+  for (const v of variants) {
+    if (v.properties && typeof v.properties === 'object') {
+      Object.assign(props, v.properties as Record<string, unknown>);
+    }
+  }
+  if (Object.keys(props).length > 0) merged.properties = props;
+
+  // `required` conflicts across mutually-exclusive variants — keep only keys
+  // every variant requires (safe), otherwise drop it rather than over-constrain.
+  if (!('required' in merged) && variants.length > 0) {
+    const reqLists = variants.map(v => (Array.isArray(v.required) ? (v.required as string[]) : []));
+    const common = reqLists.reduce((acc, r) => acc.filter(x => r.includes(x)), reqLists[0] ?? []);
+    if (common.length > 0) merged.required = common;
+  }
+
+  return merged;
 }

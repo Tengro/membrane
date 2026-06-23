@@ -303,7 +303,7 @@ export class BedrockAdapter implements ProviderAdapter {
     options?: ProviderRequestOptions
   ): Promise<ProviderResponse> {
     const bedrockModelId = this.toBedrockModelId(request.model);
-    const bedrockRequest = this.buildRequest(request);
+    const bedrockRequest = this.buildRequest(request, bedrockModelId);
     const fullRequest = { modelId: bedrockModelId, ...bedrockRequest };
     options?.onRequest?.(fullRequest);
 
@@ -324,7 +324,7 @@ export class BedrockAdapter implements ProviderAdapter {
     options?: ProviderRequestOptions
   ): Promise<ProviderResponse> {
     const bedrockModelId = this.toBedrockModelId(request.model);
-    const bedrockRequest = this.buildRequest(request);
+    const bedrockRequest = this.buildRequest(request, bedrockModelId);
     const fullRequest = { modelId: bedrockModelId, ...bedrockRequest, stream: true };
     options?.onRequest?.(fullRequest);
 
@@ -338,7 +338,7 @@ export class BedrockAdapter implements ProviderAdapter {
     }
   }
 
-  private buildRequest(request: ProviderRequest): BedrockMessageRequest {
+  private buildRequest(request: ProviderRequest, bedrockModelId?: string): BedrockMessageRequest {
     // Strip provider-specific fields (e.g., sourceUrl for Gemini) from image blocks
     // before sending to Bedrock/Anthropic, which rejects extra inputs
     const sanitizedMessages = (request.messages as any[]).map((msg: any) => {
@@ -362,8 +362,17 @@ export class BedrockAdapter implements ProviderAdapter {
     };
 
     // Handle system prompt
+    // Claude 3 Sonnet (20240229) on Bedrock intermittently rejects the array content-block
+    // format for system prompts via APAC cross-region inference. Flatten to a plain string
+    // for this model to avoid the "system: Input should be a valid string" validation error.
     if (request.system) {
-      params.system = request.system as BedrockMessageRequest['system'];
+      const needsFlatten = bedrockModelId?.includes('claude-3-sonnet-20240229') ?? false;
+      if (needsFlatten && Array.isArray(request.system)) {
+        const blocks = request.system as Array<{ type: string; text: string }>;
+        params.system = blocks.map(b => b.text).join('\n\n');
+      } else {
+        params.system = request.system as BedrockMessageRequest['system'];
+      }
     }
 
     if (request.temperature !== undefined) {
@@ -533,8 +542,9 @@ export class BedrockAdapter implements ProviderAdapter {
           const payloadEnd = totalLength - 4;
           const payloadBytes = buffer.slice(payloadStart, payloadEnd);
 
-          // Parse headers to find event type
+          // Parse headers to find event type and exception type
           let eventType = '';
+          let exceptionType = '';
           let headerOffset = 12;
           const headerEnd = 12 + headersLength;
           while (headerOffset < headerEnd) {
@@ -554,11 +564,28 @@ export class BedrockAdapter implements ProviderAdapter {
 
               if (name === ':event-type') {
                 eventType = value;
+              } else if (name === ':exception-type') {
+                exceptionType = value;
               }
             } else {
               // Skip other header types
               break;
             }
+          }
+
+          // Handle exception events from Bedrock (throttling, model errors, etc.)
+          if (exceptionType) {
+            let errorMessage = exceptionType;
+            try {
+              const exPayload = JSON.parse(new TextDecoder().decode(payloadBytes));
+              errorMessage = exPayload.message || exPayload.Message || exceptionType;
+            } catch {
+              // Use exception type as message
+            }
+            throw new BedrockError(
+              exceptionType.toLowerCase().includes('throttl') ? 429 : 500,
+              `Bedrock stream error (${exceptionType}): ${errorMessage}`
+            );
           }
 
           // Parse the JSON payload
@@ -574,6 +601,14 @@ export class BedrockAdapter implements ProviderAdapter {
                   bytes[i] = binaryStr.charCodeAt(i);
                 }
                 const eventData = JSON.parse(new TextDecoder().decode(bytes)) as BedrockStreamEvent;
+
+                // Check for error events within the stream
+                if (eventData.type === 'error') {
+                  throw new BedrockError(
+                    500,
+                    `Bedrock stream error: ${(eventData as any).error?.message || JSON.stringify(eventData)}`
+                  );
+                }
 
                 if (eventData.type === 'message_start' && eventData.message) {
                   inputTokens = eventData.message.usage?.input_tokens ?? 0;
@@ -598,6 +633,14 @@ export class BedrockAdapter implements ProviderAdapter {
                       contentBlocks[currentBlockIndex]!.signature = (contentBlocks[currentBlockIndex]!.signature ?? '') + (eventData.delta as any).signature;
                     }
                   }
+                } else if (eventData.type === 'content_block_stop') {
+                  // Mirror the Anthropic adapter: fire onContentBlock a second
+                  // time with the finalised block so consumers can distinguish
+                  // start from stop. Without this, downstream code that depends
+                  // on the dual-fire convention (e.g. membrane's native
+                  // yielding path) silently drops block_complete on Bedrock.
+                  const blockIdx = (eventData as { index?: number }).index ?? currentBlockIndex;
+                  callbacks.onContentBlock?.(blockIdx, contentBlocks[blockIdx]);
                 } else if (eventData.type === 'message_delta') {
                   if (eventData.usage) {
                     outputTokens = eventData.usage.output_tokens;
@@ -607,8 +650,11 @@ export class BedrockAdapter implements ProviderAdapter {
                   }
                 }
               }
-            } catch {
-              // Skip malformed events
+            } catch (e) {
+              // Re-throw BedrockErrors (from error events above)
+              if (e instanceof BedrockError) throw e;
+              // Skip genuinely malformed events (e.g. truncated JSON)
+              console.warn('[membrane:bedrock] Skipping malformed stream event:', e);
             }
           }
 
@@ -620,6 +666,14 @@ export class BedrockAdapter implements ProviderAdapter {
       reader.releaseLock();
     }
 
+    // Detect empty responses — Bedrock returned no content and no tokens
+    if (contentBlocks.length === 0 && inputTokens === 0 && outputTokens === 0) {
+      throw new BedrockError(
+        500,
+        'Bedrock returned empty response: no content blocks, 0 input/output tokens. This may indicate a transient service issue.'
+      );
+    }
+
     // Build response from accumulated data
     finalMessage = {
       id: 'msg_stream',
@@ -627,7 +681,11 @@ export class BedrockAdapter implements ProviderAdapter {
       role: 'assistant',
       content: contentBlocks.map(b => {
         if (b.type === 'thinking') {
-          return { type: 'thinking' as const, thinking: b.thinking, signature: b.signature };
+          return { type: 'thinking' as const, thinking: b.thinking ?? '', signature: b.signature };
+        }
+        if (b.type === 'redacted_thinking') {
+          // Pass through verbatim — carries the encrypted `data` payload
+          return { ...b } as unknown as { type: 'text'; text?: string };
         }
         return { type: b.type as 'text', text: b.text };
       }),
@@ -655,12 +713,17 @@ export class BedrockAdapter implements ProviderAdapter {
           name: block.name,
           input: block.input as Record<string, unknown>,
         });
-      } else if (block.type === 'thinking' && block.thinking) {
+      } else if (block.type === 'thinking') {
+        // Signature-only thinking blocks (display:'omitted') have an empty
+        // thinking field but must still be preserved for round-tripping.
         content.push({
           type: 'thinking',
-          thinking: block.thinking,
-          signature: block.signature,
+          thinking: block.thinking ?? '',
+          ...(block.signature ? { signature: block.signature } : {}),
         });
+      } else if ((block as any).type === 'redacted_thinking') {
+        // Pass through verbatim — carries the encrypted `data` payload
+        content.push({ ...(block as any) } as ContentBlock);
       }
     }
 

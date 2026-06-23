@@ -113,6 +113,12 @@ export interface ThinkingContent {
 
 export interface RedactedThinkingContent {
   type: 'redacted_thinking';
+  /**
+   * Encrypted reasoning payload from the provider. Opaque — must be
+   * round-tripped verbatim in assistant turns or the block is worthless
+   * (the API decrypts it to reconstruct prior reasoning).
+   */
+  data: string;
 }
 
 // ============================================================================
