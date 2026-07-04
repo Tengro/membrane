@@ -43,7 +43,8 @@ type OpenRouterContentBlock =
  * actually accepts which format is the model's concern — this is just plumbing).
  */
 function audioMimeToFormat(mimeType: string): string | undefined {
-  switch (mimeType.toLowerCase()) {
+  // Strip MIME parameters ("audio/mpeg; rate=16000") before matching.
+  switch (mimeType.split(';')[0]!.trim().toLowerCase()) {
     case 'audio/mpeg':
     case 'audio/mp3':
     case 'audio/mpeg3':      // legacy MP3 aliases some clients (e.g. Discord) report
