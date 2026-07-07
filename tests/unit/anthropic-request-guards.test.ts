@@ -171,6 +171,50 @@ describe('AnthropicAdapter: sampling-parameter model gate', () => {
     expect(captured[0]).not.toHaveProperty('top_p');
     expect(captured[1].top_p).toBe(0.97);
   });
+
+  // The `extra` passthrough (Object.assign) runs after the gate above, so
+  // sampling params smuggled through it must be stripped too — otherwise they
+  // reintroduce the very 400 the gate prevents.
+  it('drops temperature/top_p/top_k passed via `extra` for reject-list models', async () => {
+    const { adapter, captured } = captureAdapter();
+
+    await adapter.complete({
+      ...baseRequest,
+      model: 'claude-haiku-4-5',
+      extra: { temperature: 0.7, top_p: 0.9, top_k: 40 },
+    } as any);
+
+    expect(captured[0]).not.toHaveProperty('temperature');
+    expect(captured[0]).not.toHaveProperty('top_p');
+    expect(captured[0]).not.toHaveProperty('top_k');
+  });
+
+  it('drops temperature/top_k passed via `extra` under extended thinking', async () => {
+    const { adapter, captured } = captureAdapter();
+
+    await adapter.complete({
+      ...baseRequest,
+      model: 'claude-sonnet-4-5',
+      thinking: { type: 'enabled', budget_tokens: 2048 },
+      extra: { temperature: 0.7, top_k: 40 },
+    } as any);
+
+    expect(captured[0]).not.toHaveProperty('temperature');
+    expect(captured[0]).not.toHaveProperty('top_k');
+    expect(captured[0].thinking).toEqual({ type: 'enabled', budget_tokens: 2048 });
+  });
+
+  it('keeps sampling params passed via `extra` for models that still accept them', async () => {
+    const { adapter, captured } = captureAdapter();
+
+    await adapter.complete({
+      ...baseRequest,
+      model: 'claude-sonnet-4-5',
+      extra: { temperature: 0.3 },
+    } as any);
+
+    expect(captured[0].temperature).toBe(0.3);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -261,6 +305,32 @@ describe('flattenRootSchemaUnion', () => {
     expect(result).not.toHaveProperty('allOf');
     expect(result.type).toBe('object');
     expect([...result.required].sort()).toEqual(['a', 'b']);
+  });
+
+  it('merges all root union keys when multiple combinators are present at once', () => {
+    const schema = {
+      oneOf: [
+        { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] },
+        { type: 'object', properties: { b: { type: 'string' } }, required: ['b'] },
+      ],
+      anyOf: [
+        { type: 'object', properties: { c: { type: 'string' } }, required: ['c'] },
+        { type: 'object', properties: { d: { type: 'string' } }, required: ['c', 'd'] },
+      ],
+    };
+
+    const result = flattenRootSchemaUnion(schema) as Record<string, any>;
+
+    // No combinator survives, and neither combinator's variants are dropped.
+    expect(result).not.toHaveProperty('oneOf');
+    expect(result).not.toHaveProperty('anyOf');
+    expect(result.type).toBe('object');
+    expect(Object.keys(result.properties).sort()).toEqual(['a', 'b', 'c', 'd']);
+    // oneOf intersection = [] ; anyOf intersection = ['c'] ; union across = ['c'].
+    expect(result.required).toEqual(['c']);
+    // Both alternative combinators contribute an argument-group note line.
+    expect(result.description).toContain('(a) | (b)');
+    expect(result.description).toContain('(c) | (c, d)');
   });
 
   it('drops variant-level additionalProperties:false from the merged schema', () => {

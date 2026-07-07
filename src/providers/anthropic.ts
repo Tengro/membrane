@@ -416,6 +416,21 @@ export class AnthropicAdapter implements ProviderAdapter {
     // Apply extra params, excluding internal membrane fields
     if (request.extra) {
       const { normalizedMessages, prompt, ...rest } = request.extra as Record<string, unknown>;
+      // Sampling params passed through `extra` must obey the same gates as the
+      // top-level ones. Otherwise a caller passing e.g. `extra: { temperature }`
+      // for a reject-list model (or under extended thinking) would re-insert the
+      // stripped value here — via Object.assign, after the gate above — and
+      // reproduce the exact non-retryable 400 this stripping is meant to prevent.
+      if (stripSampling || thinkingOn) {
+        delete rest.temperature;
+        delete rest.top_k;
+        // top_p is accepted in [0.95, 1] while thinking is on, but never when
+        // the model rejects sampling params outright.
+        const extraTopP = rest.top_p;
+        if (stripSampling || typeof extraTopP !== 'number' || extraTopP < 0.95) {
+          delete rest.top_p;
+        }
+      }
       Object.assign(params, rest);
     }
 
