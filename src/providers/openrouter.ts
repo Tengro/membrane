@@ -31,7 +31,45 @@ import { safeParseJson, createCombinedSignal, SSELineParser } from './utils.js';
 /** Content block for messages through OpenRouter */
 type OpenRouterContentBlock =
   | { type: 'text'; text: string; cache_control?: { type: 'ephemeral' } }
-  | { type: 'image_url'; image_url: { url: string; detail?: string } };
+  | { type: 'image_url'; image_url: { url: string; detail?: string } }
+  | { type: 'input_audio'; input_audio: { data: string; format: string } };
+
+/**
+ * Map a media MIME type to the `format` string OpenRouter expects on an
+ * `input_audio` part. OpenRouter follows the OpenAI Chat Completions shape and
+ * documents these format values: wav, mp3, aiff, aac, ogg, flac, m4a, pcm16,
+ * pcm24. Returns undefined for MIME types we don't have a mapping for, so the
+ * caller can skip the block rather than send a malformed part (which model
+ * actually accepts which format is the model's concern — this is just plumbing).
+ */
+function audioMimeToFormat(mimeType: string): string | undefined {
+  // Strip MIME parameters ("audio/mpeg; rate=16000") before matching.
+  switch (mimeType.split(';')[0]!.trim().toLowerCase()) {
+    case 'audio/mpeg':
+    case 'audio/mp3':
+    case 'audio/mpeg3':      // legacy MP3 aliases some clients (e.g. Discord) report
+    case 'audio/x-mpeg-3':
+      return 'mp3';
+    case 'audio/wav':
+    case 'audio/x-wav':
+    case 'audio/wave':
+    case 'audio/vnd.wave':
+      return 'wav';
+    case 'audio/ogg':
+      return 'ogg';
+    case 'audio/flac':
+    case 'audio/x-flac':
+      return 'flac';
+    case 'audio/aac':
+      return 'aac';
+    case 'audio/mp4':
+    case 'audio/m4a':
+    case 'audio/x-m4a':
+      return 'm4a';
+    default:
+      return undefined;
+  }
+}
 
 interface OpenRouterMessage {
   role: 'user' | 'assistant' | 'system' | 'tool';
@@ -193,8 +231,27 @@ export class OpenRouterAdapter implements ProviderAdapter {
         for (const data of dataLines) {
           if (data === '[DONE]') continue;
 
+          // Parse first; only JSON noise is ignorable. Everything after the
+          // parse must NOT be swallowed by the catch below.
+          let parsed: Record<string, any>;
           try {
-            const parsed = JSON.parse(data);
+            parsed = JSON.parse(data);
+          } catch {
+            continue; // Ignore parse errors (partial/keep-alive lines)
+          }
+
+          // OpenRouter delivers mid-stream failures (e.g. upstream 429s) as an
+          // SSE data line with an `error` payload. Silently ignoring it would
+          // yield a fake-successful empty completion — surface it instead so
+          // retry logic can handle it.
+          if (typeof parsed === 'object' && parsed !== null && parsed.error) {
+            const err = parsed.error as { code?: number | string; message?: string };
+            throw new Error(
+              `OpenRouter stream error${err.code !== undefined ? ` (${err.code})` : ''}: ${err.message ?? JSON.stringify(err)}`
+            );
+          }
+
+          try {
             const delta = parsed.choices?.[0]?.delta;
 
             if (delta?.content) {
@@ -370,10 +427,11 @@ export class OpenRouterAdapter implements ProviderAdapter {
         const textParts: string[] = [];
         const toolResults: OpenRouterMessage[] = [];
         let hasImages = false;
+        let hasAudio = false;
 
         for (const block of msg.content) {
           if (block.type === 'text') {
-            if (hasCache || hasImages) {
+            if (hasCache || hasImages || hasAudio) {
               const contentBlock: OpenRouterContentBlock = {
                 type: 'text',
                 text: block.text,
@@ -406,6 +464,37 @@ export class OpenRouterAdapter implements ProviderAdapter {
                 image_url: { url: block.source.url },
               });
             }
+          } else if (block.type === 'audio') {
+            // Audio input → OpenAI-style `input_audio` content part (sibling to
+            // the Gemini inlineData path). Like images, this forces the array
+            // content format. MIME (canonical `mediaType`, falling back to
+            // snake_case `media_type`, then `audio/mpeg`) is mapped to
+            // OpenRouter's `format`; unmappable types are skipped with a warning
+            // rather than sending a malformed part. Data is raw base64 (no
+            // data-uri prefix), matching the Gemini audio path.
+            hasAudio = true;
+            // Migrate any already-collected textParts into contentBlocks
+            // (we didn't know we'd need array format until hitting audio).
+            for (const text of textParts) {
+              contentBlocks.push({ type: 'text', text });
+            }
+            textParts.length = 0;
+
+            if (block.source?.type === 'base64' && block.source.data) {
+              const mediaType = block.source.mediaType ?? block.source.media_type ?? 'audio/mpeg';
+              const format = audioMimeToFormat(mediaType);
+              if (format) {
+                contentBlocks.push({
+                  type: 'input_audio',
+                  input_audio: { data: block.source.data, format },
+                });
+              } else {
+                console.warn(
+                  `[membrane:openrouter] Skipping audio block with unsupported MIME type "${mediaType}" ` +
+                  `(no OpenRouter input_audio format mapping)`
+                );
+              }
+            }
           } else if (block.type === 'tool_use') {
             toolCalls.push({
               id: block.id,
@@ -435,8 +524,8 @@ export class OpenRouterAdapter implements ProviderAdapter {
           return [];
         }
 
-        // Use content blocks array if caching or images require it, otherwise concatenate text
-        const useArray = hasCache || hasImages;
+        // Use content blocks array if caching, images, or audio require it, otherwise concatenate text
+        const useArray = hasCache || hasImages || hasAudio;
         const result: OpenRouterMessage = {
           role: msg.role,
           content: useArray ? contentBlocks : (textParts.length > 0 ? textParts.join('\n') : null),
