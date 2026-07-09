@@ -47,6 +47,26 @@ interface OpenAIMessage {
   content?: string | OpenAIContentPart[] | null;
   tool_calls?: OpenAIToolCall[];
   tool_call_id?: string;
+  /** Reasoning-model trace (OpenRouter et al. deliver this in a separate
+   *  channel from `content`). Captured into a thinking block, and re-sent on
+   *  prior assistant turns to preserve chain-of-thought. */
+  reasoning?: string;
+  reasoning_details?: unknown;
+}
+
+/**
+ * Some OpenRouter backends (e.g. Parasail, Io Net) spill the tail of the
+ * reasoning plus the closing `</think>` into the `content` channel instead of
+ * keeping it all in `reasoning`. If a `</think>` appears with no matching
+ * `<think>` before it, drop everything up to and including it — that prefix is
+ * leaked reasoning, not answer text.
+ */
+function stripOrphanThinkClose(text: string): string {
+  const close = text.indexOf('</think>');
+  if (close === -1) return text;
+  const open = text.indexOf('<think>');
+  if (open !== -1 && open < close) return text; // well-formed inline block — leave it
+  return text.slice(close + '</think>'.length).replace(/^\s+/, '');
 }
 
 interface OpenAIToolCall {
@@ -178,6 +198,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       const decoder = new TextDecoder();
       const sseParser = new SSELineParser();
       let accumulated = '';
+      let reasoning = '';
       let finishReason = 'stop';
       let toolCalls: OpenAIToolCall[] = [];
 
@@ -198,6 +219,11 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
             if (delta?.content) {
               accumulated += delta.content;
               callbacks.onChunk(delta.content);
+            }
+
+            // Reasoning-model trace arrives on its own channel (not `content`).
+            if (typeof delta?.reasoning === 'string') {
+              reasoning += delta.reasoning;
             }
 
             // Handle streaming tool calls
@@ -233,6 +259,8 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
         role: 'assistant',
         content: accumulated || null,
       };
+
+      if (reasoning) message.reasoning = reasoning;
 
       if (toolCalls.length > 0) {
         message.tool_calls = toolCalls;
@@ -336,10 +364,18 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
         const contentParts: OpenAIContentPart[] = [];
         const toolCalls: OpenAIToolCall[] = [];
         const toolResults: OpenAIMessage[] = [];
+        let reasoningText = '';
 
         for (const block of msg.content) {
           if (block.type === 'text') {
             contentParts.push({ type: 'text', text: block.text });
+          } else if (block.type === 'thinking') {
+            // Round-trip the reasoning trace back to the provider (OpenRouter
+            // accepts `reasoning` on a prior assistant turn), mirroring how the
+            // Anthropic adapter re-feeds signed thinking blocks.
+            if (typeof block.thinking === 'string') {
+              reasoningText += (reasoningText ? '\n' : '') + block.thinking;
+            }
           } else if (block.type === 'image') {
             // Convert Anthropic-style image to OpenAI image_url with data URI
             if (block.source?.type === 'base64') {
@@ -394,6 +430,10 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
 
         if (toolCalls.length > 0) {
           result.tool_calls = toolCalls;
+        }
+
+        if (reasoningText) {
+          result.reasoning = reasoningText;
         }
 
         return [result];
@@ -486,11 +526,18 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
 
     const content: ContentBlock[] = [];
 
+    // Reasoning trace first (mirrors Anthropic thinking-block ordering).
+    const reasoning = (message as OpenAIMessage).reasoning;
+    if (typeof reasoning === 'string' && reasoning.trim()) {
+      content.push({ type: 'thinking', thinking: reasoning } as ContentBlock);
+    }
+
     if (message.content) {
-      const text = typeof message.content === 'string' ? message.content : message.content.filter(p => p.type === 'text').map(p => p.text!).join('\n');
+      const raw = typeof message.content === 'string' ? message.content : message.content.filter(p => p.type === 'text').map(p => p.text!).join('\n');
+      const text = stripOrphanThinkClose(raw);
       if (text) content.push({ type: 'text', text });
     }
-    
+
     if (message.tool_calls) {
       for (const tc of message.tool_calls) {
         content.push({
@@ -575,10 +622,15 @@ export function toOpenAIMessages(
     const textParts: string[] = [];
     const toolCalls: OpenAIToolCall[] = [];
     const toolResults: { id: string; content: string }[] = [];
-    
+    let reasoningText = '';
+
     for (const block of msg.content) {
       if (block.type === 'text') {
         textParts.push(block.text);
+      } else if (block.type === 'thinking') {
+        if (typeof (block as { thinking?: string }).thinking === 'string') {
+          reasoningText += (reasoningText ? '\n' : '') + (block as { thinking: string }).thinking;
+        }
       } else if (block.type === 'tool_use') {
         toolCalls.push({
           id: block.id,
@@ -597,13 +649,16 @@ export function toOpenAIMessages(
     }
     
     // Add main message
-    if (textParts.length > 0 || toolCalls.length > 0) {
+    if (textParts.length > 0 || toolCalls.length > 0 || reasoningText) {
       const message: OpenAIMessage = {
         role: msg.role as 'user' | 'assistant',
         content: textParts.join('\n') || null,
       };
       if (toolCalls.length > 0) {
         message.tool_calls = toolCalls;
+      }
+      if (reasoningText) {
+        message.reasoning = reasoningText;
       }
       result.push(message);
     }
@@ -627,11 +682,17 @@ export function toOpenAIMessages(
 export function fromOpenAIMessage(message: OpenAIMessage): ContentBlock[] {
   const result: ContentBlock[] = [];
 
+  const reasoning = message.reasoning;
+  if (typeof reasoning === 'string' && reasoning.trim()) {
+    result.push({ type: 'thinking', thinking: reasoning } as ContentBlock);
+  }
+
   if (message.content) {
-    const text = typeof message.content === 'string' ? message.content : message.content.filter(p => p.type === 'text').map(p => p.text!).join('\n');
+    const raw = typeof message.content === 'string' ? message.content : message.content.filter(p => p.type === 'text').map(p => p.text!).join('\n');
+    const text = stripOrphanThinkClose(raw);
     if (text) result.push({ type: 'text', text });
   }
-  
+
   if (message.tool_calls) {
     for (const tc of message.tool_calls) {
       result.push({
