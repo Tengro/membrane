@@ -3,6 +3,7 @@
  */
 
 import Anthropic, { type ClientOptions } from '@anthropic-ai/sdk';
+import { shedImagesToFitByteBudget } from '../utils/image-media.js';
 import type {
   ProviderAdapter,
   ProviderRequest,
@@ -371,6 +372,14 @@ export class AnthropicAdapter implements ProviderAdapter {
         }),
       };
     });
+
+    // Byte-budget safety net at the LAST exit before the SDK: token budgets
+    // are blind to base64 bulk, so an image-heavy window can pass the context
+    // budget yet exceed the API's total request size (413 request_too_large —
+    // Mythos 2026-07-12, 47 images / 34MB). Shed oldest inline images until
+    // the request fits. Runs here (not only in buildNativeToolRequest)
+    // because multiple compile paths converge on this provider.
+    shedImagesToFitByteBudget(sanitizedMessages);
 
     const params: Anthropic.MessageCreateParams = {
       model: request.model,
