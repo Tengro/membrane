@@ -365,6 +365,52 @@ export class NativeFormatter implements PrefillFormatter {
   // PRIVATE HELPERS
   // ==========================================================================
 
+  /** Media types the Anthropic API accepts for image blocks. Anything else in
+   *  a request draws a 400 invalid_request — and because blocks live in the
+   *  agent's event store, ONE bad block poisons every subsequent compile and
+   *  hard-downs the agent (LabClaude 2026-07-11: an `image/svg` attachment
+   *  that slipped through an ingest surface). Sanitizing here, at request-
+   *  build time, both guards new content and heals already-stored poison. */
+  private static readonly ACCEPTED_IMAGE_MEDIA_TYPES = new Set([
+    'image/jpeg',
+    'image/png',
+    'image/gif',
+    'image/webp',
+  ]);
+
+  private static imagePlaceholder(mediaType: unknown): { type: 'text'; text: string } {
+    console.warn(
+      `[NativeFormatter] image block stripped: unsupported media type "${String(mediaType)}"`,
+    );
+    return {
+      type: 'text',
+      text:
+        `[system: an image that belongs here was NOT shown to you — its media type ` +
+        `"${String(mediaType)}" is not accepted by the model API (only jpeg/png/gif/webp are). ` +
+        `You are not seeing this image. If it matters, ask for it in a supported format.]`,
+    };
+  }
+
+  /** Replace API-unacceptable image blocks nested in tool_result content with
+   *  text placeholders. Non-array content passes through untouched. */
+  private static sanitizeToolResultContent(content: unknown): unknown {
+    if (!Array.isArray(content)) return content;
+    return content.map((item) => {
+      if (
+        item &&
+        typeof item === 'object' &&
+        (item as { type?: string }).type === 'image'
+      ) {
+        const src = (item as { source?: { media_type?: string } }).source;
+        const mt = (src?.media_type ?? '').toLowerCase();
+        if (!NativeFormatter.ACCEPTED_IMAGE_MEDIA_TYPES.has(mt)) {
+          return NativeFormatter.imagePlaceholder(src?.media_type);
+        }
+      }
+      return item;
+    });
+  }
+
   private convertContent(
     content: ContentBlock[],
     participant: string,
@@ -387,19 +433,26 @@ export class NativeFormatter implements PrefillFormatter {
         result.push(textBlock);
       } else if (block.type === 'image') {
         if (block.source.type === 'base64') {
-          const imageBlock: Record<string, unknown> = {
-            type: 'image',
-            source: {
-              type: 'base64',
-              media_type: block.source.mediaType,
-              data: block.source.data,
-            },
-          };
-          // Preserve sourceUrl for providers that use URL-as-text (Gemini 3.x)
-          if (block.sourceUrl) {
-            imageBlock.sourceUrl = block.sourceUrl;
+          const mediaType = (block.source.mediaType ?? '').toLowerCase();
+          if (!NativeFormatter.ACCEPTED_IMAGE_MEDIA_TYPES.has(mediaType)) {
+            // Unacceptable media type (e.g. image/svg): degrade to a text
+            // placeholder instead of poisoning the whole request.
+            result.push(NativeFormatter.imagePlaceholder(block.source.mediaType));
+          } else {
+            const imageBlock: Record<string, unknown> = {
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: block.source.mediaType,
+                data: block.source.data,
+              },
+            };
+            // Preserve sourceUrl for providers that use URL-as-text (Gemini 3.x)
+            if (block.sourceUrl) {
+              imageBlock.sourceUrl = block.sourceUrl;
+            }
+            result.push(imageBlock);
           }
-          result.push(imageBlock);
         }
       } else if (block.type === 'audio') {
         // Pass audio through in the same shape as images — the provider
@@ -426,7 +479,7 @@ export class NativeFormatter implements PrefillFormatter {
         result.push({
           type: 'tool_result',
           tool_use_id: block.toolUseId,
-          content: block.content,
+          content: NativeFormatter.sanitizeToolResultContent(block.content),
           is_error: block.isError,
         });
       } else if (block.type === 'thinking') {
