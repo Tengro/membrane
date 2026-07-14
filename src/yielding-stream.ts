@@ -10,8 +10,20 @@ import type {
   YieldingStream,
   YieldingStreamOptions,
   ToolCallsEvent,
+  InjectedMessage,
+  ProvideToolResultsOptions,
 } from './types/yielding-stream.js';
 import type { ToolResult } from './types/tools.js';
+
+/**
+ * Payload handed from provideToolResults() to the inference loop awaiting
+ * requestToolExecution(): the round's tool results plus any mid-turn
+ * messages the consumer wants the next inference round to see.
+ */
+export interface ToolResultsPayload {
+  results: ToolResult[];
+  injectedMessages?: InjectedMessage[];
+}
 
 // ============================================================================
 // Internal State Types
@@ -25,7 +37,7 @@ type StreamState =
   | { status: 'error'; error: Error };
 
 interface PendingToolResults {
-  resolve: (results: ToolResult[]) => void;
+  resolve: (payload: ToolResultsPayload) => void;
   reject: (error: Error) => void;
 }
 
@@ -98,7 +110,7 @@ export class YieldingStreamImpl implements YieldingStream {
     return this.abortController.signal;
   }
 
-  provideToolResults(results: ToolResult[]): void {
+  provideToolResults(results: ToolResult[], options?: ProvideToolResultsOptions): void {
     if (this.state.status !== 'waiting_for_tools') {
       throw new Error(
         `Cannot provide tool results: stream is not waiting for tools (status: ${this.state.status})`
@@ -119,8 +131,32 @@ export class YieldingStreamImpl implements YieldingStream {
       }
     }
 
+    // Injected messages must be user-side content only — tool blocks here
+    // would corrupt the tool-cycle structure the normalizer guarantees.
+    // Offending BLOCKS are stripped (loudly) rather than thrown on: a throw
+    // at this point would leave the stream parked in waiting_for_tools with
+    // an unresolvable promise — wedging the caller's whole turn over a
+    // notification is far worse than delivering it without its tool blocks.
+    const injectedMessages = options?.injectedMessages
+      ?.map((m) => {
+        const clean = m.content.filter(
+          (block) => block.type !== 'tool_use' && block.type !== 'tool_result'
+        );
+        if (clean.length !== m.content.length) {
+          console.warn(
+            `[membrane] provideToolResults: stripped ${m.content.length - clean.length} ` +
+            `tool block(s) from an injected mid-turn message (user-side content only)`
+          );
+        }
+        return { ...m, content: clean };
+      })
+      .filter((m) => m.content.length > 0);
+
     // Resolve the promise and transition state
-    this.pendingToolResults.resolve(results);
+    this.pendingToolResults.resolve({
+      results,
+      ...(injectedMessages && injectedMessages.length > 0 ? { injectedMessages } : {}),
+    });
     this.pendingToolResults = null;
     this.state = { status: 'streaming' };
     this._toolDepth++;
@@ -198,7 +234,7 @@ export class YieldingStreamImpl implements YieldingStream {
    * Request tool execution and wait for results.
    * Called by the inference loop when tool calls are detected.
    */
-  async requestToolExecution(event: ToolCallsEvent): Promise<ToolResult[]> {
+  async requestToolExecution(event: ToolCallsEvent): Promise<ToolResultsPayload> {
     // Emit the tool calls event
     this.emit(event);
 
@@ -209,7 +245,7 @@ export class YieldingStreamImpl implements YieldingStream {
     };
 
     // Create a promise that will be resolved by provideToolResults()
-    return new Promise<ToolResult[]>((resolve, reject) => {
+    return new Promise<ToolResultsPayload>((resolve, reject) => {
       this.pendingToolResults = { resolve, reject };
     });
   }

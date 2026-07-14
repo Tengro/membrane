@@ -409,8 +409,25 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
           }
         }
 
-        // If we have tool results, return them (possibly multiple)
+        // If we have tool results, emit them (possibly multiple) as
+        // role:'tool' messages — plus a FOLLOWING user message for any other
+        // content sharing the envelope (e.g. a mid-turn injected user message
+        // that mergeConsecutiveRoles folded into the tool_result envelope),
+        // instead of silently dropping it. Mirrors openai.ts / openrouter.ts.
         if (toolResults.length > 0) {
+          const hasImagesInterloper = contentParts.some(p => p.type === 'image_url');
+          const interloperText = hasImagesInterloper
+            ? ''
+            : contentParts.filter(p => p.type === 'text').map(p => p.text!).join('\n');
+          if (hasImagesInterloper || interloperText) {
+            return [
+              ...toolResults,
+              {
+                role: 'user' as const,
+                content: hasImagesInterloper ? contentParts : interloperText,
+              },
+            ];
+          }
           return toolResults;
         }
 

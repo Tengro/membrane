@@ -2016,6 +2016,8 @@ export class Membrane {
     const formatter = this.formatter;
     const parser = formatter.createStreamParser();
     let toolDepth = 0;
+    // Once-per-stream latch for the injectedMessages-unsupported warning.
+    let warnedInjectionUnsupported = false;
     let totalUsage: DetailedUsage = { inputTokens: 0, outputTokens: 0 };
     const pricing = this.resolvePricing(request.config.model);
     const contentBlocks: ContentBlock[] = [];
@@ -2239,7 +2241,21 @@ export class Membrane {
               context,
             };
 
-            const results = await stream.requestToolExecution(toolCallsEvent);
+            const { results, injectedMessages } = await stream.requestToolExecution(toolCallsEvent);
+
+            // Mid-turn injected messages are not supported on the XML prefill
+            // path: the continuation is an assistant prefill over an XML
+            // transcript, not a message array, so there is no user envelope
+            // to append to. Warn (once per stream — long turns have many
+            // rounds) rather than drop silently; the messages remain in the
+            // caller's context window and reach the model on the next turn.
+            if (injectedMessages && injectedMessages.length > 0 && !warnedInjectionUnsupported) {
+              warnedInjectionUnsupported = true;
+              console.warn(
+                `[membrane] provideToolResults injectedMessages ignored: XML tool mode ` +
+                `does not support mid-turn injection (delivered next turn instead)`
+              );
+            }
 
             // Track the tool results
             executedToolResults.push(...results);
@@ -2662,7 +2678,7 @@ export class Membrane {
             context,
           };
 
-          const results = await stream.requestToolExecution(toolCallsEvent);
+          const { results, injectedMessages } = await stream.requestToolExecution(toolCallsEvent);
 
           // Track tool results
           executedToolResults.push(...results);
@@ -2680,13 +2696,14 @@ export class Membrane {
           // Add messages for next iteration — use the request's participant names
           const assistantName = request.assistantParticipant
             ?? this.config.assistantParticipant ?? 'Claude';
+          const userName = assistantName === 'Claude' ? 'User' : 'user';
           messages.push({
             participant: assistantName,
             content: responseBlocks,
           });
 
           messages.push({
-            participant: assistantName === 'Claude' ? 'User' : 'user',
+            participant: userName,
             content: results.map(r => ({
               type: 'tool_result' as const,
               toolUseId: r.toolUseId,
@@ -2694,6 +2711,23 @@ export class Membrane {
               isError: r.isError,
             })),
           });
+
+          // Mid-turn injection: messages that arrived while this round's
+          // tools were executing, appended AFTER the tool_result envelope so
+          // the next inference round sees them. Placed here (not co-mingled
+          // with the results) so provider conversions that special-case
+          // tool_result envelopes (e.g. ChatCompletions role:'tool') carry
+          // them as ordinary user messages. Signed-thinking adjacency is
+          // unaffected: the assistant turn above is round-tripped verbatim.
+          if (injectedMessages) {
+            for (const injected of injectedMessages) {
+              messages.push({
+                participant: injected.participant ?? userName,
+                content: injected.content,
+                ...(injected.metadata ? { metadata: injected.metadata } : {}),
+              });
+            }
+          }
 
           toolDepth++;
           continue;

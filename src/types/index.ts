@@ -132,6 +132,8 @@ export type {
   StreamEvent,
   YieldingStream,
   YieldingStreamOptions,
+  InjectedMessage,
+  ProvideToolResultsOptions,
 } from './yielding-stream.js';
 
 export {

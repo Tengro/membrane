@@ -514,8 +514,25 @@ export class OpenRouterAdapter implements ProviderAdapter {
           }
         }
 
-        // If we have tool results, return them (possibly multiple)
+        // If we have tool results, emit them (possibly multiple) as
+        // role:'tool' messages — plus a FOLLOWING user message for any other
+        // content sharing the envelope (e.g. a mid-turn injected user message
+        // that mergeConsecutiveRoles folded into the tool_result envelope),
+        // instead of silently dropping it. Mirrors openai.ts / openai-compatible.ts.
         if (toolResults.length > 0) {
+          const interloperText = textParts.join('\n');
+          if (contentBlocks.length > 0) {
+            return [
+              ...toolResults,
+              { role: 'user' as const, content: contentBlocks },
+            ];
+          }
+          if (interloperText) {
+            return [
+              ...toolResults,
+              { role: 'user' as const, content: interloperText },
+            ];
+          }
           return toolResults;
         }
 

@@ -9,6 +9,7 @@
  */
 
 import type { ContentBlock } from './content.js';
+import type { NormalizedMessage } from './message.js';
 import type { ToolCall, ToolResult, ToolContext } from './tools.js';
 import type { DetailedUsage, NormalizedResponse, StopReason } from './response.js';
 import type { ChunkMeta, BlockEvent } from './streaming.js';
@@ -122,15 +123,63 @@ export type StreamEvent =
  * }
  * ```
  */
+/**
+ * A user-side message injected into the conversation between tool rounds.
+ *
+ * This is how a consumer lets the model see events that arrived while the
+ * turn was in flight (e.g. a chat reply landing mid-way through a long
+ * tool-using turn): pass it alongside the tool results and the next
+ * inference round's request includes it as a user message AFTER the
+ * tool_result envelope.
+ *
+ * Placement guarantee: injected messages always land after the round's
+ * tool_results (the wire normalizer additionally enforces results-first
+ * ordering inside a merged envelope), so they never break the
+ * tool_use → tool_result adjacency or signed-thinking constraints.
+ *
+ * Shape: NormalizedMessage minus cacheBreakpoint (breakpoints are the
+ * request compiler's concern), with `participant` optional — it defaults to
+ * the generic user participant. Non-assistant participants get the standard
+ * "Name: " text prefix when rendered to the provider. Content must be
+ * user-side blocks only (text/image); tool blocks are stripped with a
+ * warning. NOTE: a participant equal to the request's assistantParticipant
+ * would render as an ASSISTANT turn (a prefill) — callers should not inject
+ * messages named as the assistant.
+ */
+export type InjectedMessage =
+  Omit<NormalizedMessage, 'participant' | 'cacheBreakpoint'> & {
+    participant?: string;
+  };
+
+/**
+ * Options for provideToolResults().
+ */
+export interface ProvideToolResultsOptions {
+  /**
+   * Messages that arrived while the turn was in flight, to be appended to
+   * the conversation after this round's tool_result envelope so the NEXT
+   * inference round sees them.
+   *
+   * Supported in native tool mode (Anthropic Messages, OpenAI Responses,
+   * OpenRouter). The XML prefill path currently ignores these (the
+   * continuation is an assistant prefill, not a message array) — callers
+   * on XML-mode models should deliver mid-turn events on the next turn
+   * instead.
+   */
+  injectedMessages?: InjectedMessage[];
+}
+
 export interface YieldingStream extends AsyncIterable<StreamEvent> {
   /**
    * Provide tool results after receiving a 'tool-calls' event.
    * The stream will resume and continue generating.
    *
    * @param results - Results for the tool calls (must match call IDs)
+   * @param options - Optionally inject mid-turn user messages into the
+   *   next round (see ProvideToolResultsOptions.injectedMessages)
    * @throws Error if called when not waiting for tool results
    */
-  provideToolResults(results: ToolResult[]): void;
+  provideToolResults(results: ToolResult[], options?: ProvideToolResultsOptions): void;
 
   /**
    * Cancel the stream. Any in-flight requests will be aborted.
