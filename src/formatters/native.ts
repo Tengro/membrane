@@ -35,7 +35,7 @@ import { isAcceptedImageMediaType, strippedImagePlaceholder } from '../utils/ima
  *  rejects cache_control on thinking / redacted_thinking blocks, so a cache
  *  breakpoint must attach to the last NON-thinking block. Returns -1 when the
  *  message has only thinking blocks (the breakpoint is then skipped). */
-function lastCacheableBlockIndex(blocks: Array<Record<string, unknown>>): number {
+export function lastCacheableBlockIndex(blocks: Array<Record<string, unknown>>): number {
   for (let k = blocks.length - 1; k >= 0; k--) {
     const t = blocks[k]?.type as string | undefined;
     if (t !== 'thinking' && t !== 'redacted_thinking') return k;

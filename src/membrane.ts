@@ -26,6 +26,7 @@ import type {
   ToolMode,
   ToolDefinition,
 } from './types/index.js';
+import { lastCacheableBlockIndex } from './formatters/native.js';
 import {
   DEFAULT_RETRY_CONFIG,
   MembraneError,
@@ -1087,10 +1088,24 @@ export class Membrane {
         }
       }
 
-      // Apply cache_control to last block of messages with cacheBreakpoint
+      // Apply cache_control to the last CACHEABLE block of messages with a
+      // cacheBreakpoint. The API rejects cache_control on thinking /
+      // redacted_thinking blocks (400 "thinking.cache_control: Extra inputs
+      // are not permitted"), so a breakpoint landing on a thinking-terminated
+      // message must step back to the last non-thinking block — and is skipped
+      // entirely when the message is thinking-only.
+      //
+      // 2026-07-14: this is the THIRD request builder to need the rule. The
+      // 2026-07-01 fix hardened NativeFormatter's two sites but not this one,
+      // which is the live Connectome path (native tools + thinking) — so the
+      // 400 came back the moment a breakpoint landed on a thinking-only turn.
+      // The rule now lives in ONE exported helper that every builder calls.
       if (msg.cacheBreakpoint && cacheControl && content.length > 0) {
-        content[content.length - 1].cache_control = cacheControl;
-        messageBreakpoints++;
+        const bpIdx = lastCacheableBlockIndex(content as Array<Record<string, unknown>>);
+        if (bpIdx >= 0) {
+          content[bpIdx].cache_control = cacheControl;
+          messageBreakpoints++;
+        }
       }
 
       providerMessages.push({ role, content });
