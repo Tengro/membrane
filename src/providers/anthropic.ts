@@ -186,6 +186,11 @@ export class AnthropicAdapter implements ProviderAdapter {
       let outputTokens = 0;
       let cacheCreationTokens: number | undefined;
       let cacheReadTokens: number | undefined;
+      let cacheCreation5mTokens: number | undefined;
+      let cacheCreation1hTokens: number | undefined;
+      let hasCacheCreationBreakdown = false;
+      let inferenceGeo: string | undefined;
+      let serviceTier: string | undefined;
       let stopReason: string = 'end_turn';
       let stopSequence: string | undefined;
       let stopDetails: unknown;
@@ -207,10 +212,22 @@ export class AnthropicAdapter implements ProviderAdapter {
         resetIdleTimer();
         if (event.type === 'message_start') {
           model = event.message.model;
-          const usage = event.message.usage as unknown as Record<string, number>;
-          inputTokens = usage.input_tokens ?? 0;
-          cacheCreationTokens = usage.cache_creation_input_tokens;
-          cacheReadTokens = usage.cache_read_input_tokens;
+          const usage = event.message.usage as unknown as Record<string, unknown>;
+          inputTokens = typeof usage.input_tokens === 'number' ? usage.input_tokens : 0;
+          cacheCreationTokens = typeof usage.cache_creation_input_tokens === 'number'
+            ? usage.cache_creation_input_tokens : undefined;
+          cacheReadTokens = typeof usage.cache_read_input_tokens === 'number'
+            ? usage.cache_read_input_tokens : undefined;
+          const cacheCreation = usage.cache_creation as Record<string, unknown> | undefined;
+          if (cacheCreation) {
+            hasCacheCreationBreakdown = true;
+            cacheCreation5mTokens = typeof cacheCreation.ephemeral_5m_input_tokens === 'number'
+              ? cacheCreation.ephemeral_5m_input_tokens : 0;
+            cacheCreation1hTokens = typeof cacheCreation.ephemeral_1h_input_tokens === 'number'
+              ? cacheCreation.ephemeral_1h_input_tokens : 0;
+          }
+          inferenceGeo = typeof usage.inference_geo === 'string' ? usage.inference_geo : undefined;
+          serviceTier = typeof usage.service_tier === 'string' ? usage.service_tier : undefined;
 
         } else if (event.type === 'content_block_start') {
           currentBlockIndex = event.index;
@@ -324,6 +341,14 @@ export class AnthropicAdapter implements ProviderAdapter {
             output_tokens: outputTokens,
             cache_creation_input_tokens: cacheCreationTokens,
             cache_read_input_tokens: cacheReadTokens,
+            ...(hasCacheCreationBreakdown ? {
+              cache_creation: {
+                ephemeral_5m_input_tokens: cacheCreation5mTokens ?? 0,
+                ephemeral_1h_input_tokens: cacheCreation1hTokens ?? 0,
+              },
+            } : {}),
+            ...(inferenceGeo ? { inference_geo: inferenceGeo } : {}),
+            ...(serviceTier ? { service_tier: serviceTier } : {}),
           },
         },
       };
